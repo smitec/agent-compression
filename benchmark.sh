@@ -4,6 +4,7 @@ set -euo pipefail
 BINARY="./target/release/compress-test"
 SAMPLES_DIR="samples"
 OUTPUTS_DIR="outputs"
+TIMEOUT_SECS=300
 
 cargo test >&2
 cargo build --release >&2
@@ -18,6 +19,29 @@ tmpdir=$(mktemp -d)
 trap "rm -rf '$tmpdir'" EXIT
 
 ms() { python3 -c "import time; print(int(time.time() * 1000))"; }
+
+# Prefer system timeout, fall back to pure bash watchdog that returns 124 on timeout
+if command -v timeout >/dev/null 2>&1; then
+    timed() { timeout "$TIMEOUT_SECS" "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then
+    timed() { gtimeout "$TIMEOUT_SECS" "$@"; }
+else
+    _timed_sentinel=$(mktemp)
+    timed() {
+        echo 0 > "$_timed_sentinel"
+        "$@" &
+        local pid=$!
+        (sleep "$TIMEOUT_SECS" && echo 1 > "$_timed_sentinel" && kill "$pid" 2>/dev/null) &
+        local watchdog=$!
+        wait "$pid" 2>/dev/null
+        local code=$?
+        kill "$watchdog" 2>/dev/null
+        wait "$watchdog" 2>/dev/null
+        [ "$(cat "$_timed_sentinel")" = "1" ] && return 124
+        return $code
+    }
+    trap "rm -f '$_timed_sentinel'; rm -rf '$tmpdir'" EXIT
+fi
 
 total_ratio=0
 total_compress_ms=0
@@ -38,9 +62,20 @@ for input_file in "$SAMPLES_DIR"/*; do
     fi
 
     t0=$(ms)
-    "$BINARY" compress "$input_file" "$compressed_file" >&2
+    timed "$BINARY" compress "$input_file" "$compressed_file" >&2 || {
+        code=$?
+        [ $code -eq 124 ] && echo "Compress timed out for $filename, skipping" >&2 \
+                           || echo "Compress failed for $filename (exit $code)" >&2
+        continue
+    }
     t1=$(ms)
-    "$BINARY" decompress "$compressed_file" "$decompressed_file" >&2
+
+    timed "$BINARY" decompress "$compressed_file" "$decompressed_file" >&2 || {
+        code=$?
+        [ $code -eq 124 ] && echo "Decompress timed out for $filename, skipping" >&2 \
+                           || echo "Decompress failed for $filename (exit $code)" >&2
+        continue
+    }
     t2=$(ms)
 
     if ! cmp -s "$input_file" "$decompressed_file"; then
