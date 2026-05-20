@@ -10,6 +10,10 @@ cargo build --release >&2
 
 mkdir -p "$OUTPUTS_DIR"
 
+[ -f "$SAMPLES_DIR/random_1mb.bin"   ] || dd if=/dev/urandom of="$SAMPLES_DIR/random_1mb.bin"   bs=1048576 count=1   2>/dev/null
+[ -f "$SAMPLES_DIR/random_10mb.bin"  ] || dd if=/dev/urandom of="$SAMPLES_DIR/random_10mb.bin"  bs=1048576 count=10  2>/dev/null
+[ -f "$SAMPLES_DIR/random_100mb.bin" ] || dd if=/dev/urandom of="$SAMPLES_DIR/random_100mb.bin" bs=1048576 count=100 2>/dev/null
+
 tmpdir=$(mktemp -d)
 trap "rm -rf '$tmpdir'" EXIT
 
