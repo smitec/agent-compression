@@ -65,37 +65,51 @@ fetch "video_big_buck_bunny.mp4"      "https://archive.org/download/BigBuckBunny
 # ── Derived — less-compressed versions of the above ─────────────────────────────────────────────
 # Kept alongside originals so the same content appears at different entropy levels.
 # Requires ffmpeg.  Each conversion is skipped if the output already exists or the source is missing.
+# Extra arguments after the two filenames are passed straight through to ffmpeg.
 if ! command -v ffmpeg >/dev/null 2>&1; then
     echo "ffmpeg not found — skipping derived samples" >&2
 else
     convert_sample() {
         local src="$SAMPLES_DIR/$1" dest="$SAMPLES_DIR/$2"
+        shift 2
         if [ -f "$dest" ]; then
-            echo "exists:     $2" >&2
+            echo "exists:     $(basename "$dest")" >&2
             return
         fi
         if [ ! -f "$src" ]; then
-            echo "skipping:   $2 (source $1 not present)" >&2
+            echo "skipping:   $(basename "$dest") (source $(basename "$src") not present)" >&2
             return
         fi
-        echo "converting: $1 → $2" >&2
-        if ! ffmpeg -i "$src" -y "$dest" -loglevel error 2>&1; then
-            echo "  failed:   $2" >&2
+        echo "converting: $(basename "$src") → $(basename "$dest")" >&2
+        if ! ffmpeg -i "$src" "$@" -y "$dest" -loglevel error; then
+            echo "  failed:   $(basename "$dest")" >&2
             rm -f "$dest"
         fi
     }
 
-    # JPEG → BMP  (raw RGB, zero compression — compresses very well)
+    # JPEG → BMP  (raw RGB, zero compression)
     convert_sample "img_blue_marble.jpg"          "img_blue_marble.bmp"
     convert_sample "img_earthrise.jpg"            "img_earthrise.bmp"
     convert_sample "img_buzz_aldrin.jpg"          "img_buzz_aldrin.bmp"
+    convert_sample "img_hubble_pillars.jpg"       "img_hubble_pillars.bmp"
+    convert_sample "img_mars_north_pole.jpg"      "img_mars_north_pole.bmp"
 
-    # JPEG → PNG  (lossless deflate — sits between JPEG and raw)
+    # JPEG → PNG  (lossless deflate — between JPEG and raw)
     convert_sample "img_blue_marble.jpg"          "img_blue_marble.png"
     convert_sample "img_earthrise.jpg"            "img_earthrise.png"
     convert_sample "img_buzz_aldrin.jpg"          "img_buzz_aldrin.png"
+    convert_sample "img_hubble_pillars.jpg"       "img_hubble_pillars.png"
+    convert_sample "img_mars_north_pole.jpg"      "img_mars_north_pole.png"
 
-    # OGG → WAV  (raw PCM, zero compression — compresses well)
-    convert_sample "audio_gettysburg.ogg"         "audio_gettysburg.wav"
+    # OGG/FLAC → WAV  (raw PCM, zero compression)
     convert_sample "audio_beethoven_5_mov1.ogg"   "audio_beethoven_5_mov1.wav"
+    convert_sample "audio_beethoven_5_mov2.ogg"   "audio_beethoven_5_mov2.wav"
+    convert_sample "audio_beethoven_5_mov4.ogg"   "audio_beethoven_5_mov4.wav"
+    convert_sample "audio_gettysburg.ogg"         "audio_gettysburg.wav"
+    convert_sample "audio_gettysburg_librivox.ogg" "audio_gettysburg_librivox.wav"
+    convert_sample "audio_bach_toccata.flac"      "audio_bach_toccata.wav"
+
+    # MP4 → WAV  (extract audio track only — full uncompressed video would be impractically large)
+    convert_sample "video_elephants_dream.mp4"    "video_elephants_dream_audio.wav"  -vn -acodec pcm_s16le
+    convert_sample "video_big_buck_bunny.mp4"     "video_big_buck_bunny_audio.wav"   -vn -acodec pcm_s16le
 fi
