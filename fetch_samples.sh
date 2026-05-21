@@ -61,3 +61,41 @@ fetch "audio_bach_toccata.flac"       "https://upload.wikimedia.org/wikipedia/co
 # Already compressed; expect ratio ≈ 1.0 on these.
 fetch "video_elephants_dream.mp4"     "https://archive.org/download/ElephantsDream/ed_1024_512kb.mp4"          # ~47 MB  (CC BY)
 fetch "video_big_buck_bunny.mp4"      "https://archive.org/download/BigBuckBunny_328/BigBuckBunny_512kb.mp4"   # ~41 MB  (CC BY)
+
+# ── Derived — less-compressed versions of the above ─────────────────────────────────────────────
+# Kept alongside originals so the same content appears at different entropy levels.
+# Requires ffmpeg.  Each conversion is skipped if the output already exists or the source is missing.
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "ffmpeg not found — skipping derived samples" >&2
+else
+    convert_sample() {
+        local src="$SAMPLES_DIR/$1" dest="$SAMPLES_DIR/$2"
+        if [ -f "$dest" ]; then
+            echo "exists:     $2" >&2
+            return
+        fi
+        if [ ! -f "$src" ]; then
+            echo "skipping:   $2 (source $1 not present)" >&2
+            return
+        fi
+        echo "converting: $1 → $2" >&2
+        if ! ffmpeg -i "$src" -y "$dest" -loglevel error 2>&1; then
+            echo "  failed:   $2" >&2
+            rm -f "$dest"
+        fi
+    }
+
+    # JPEG → BMP  (raw RGB, zero compression — compresses very well)
+    convert_sample "img_blue_marble.jpg"          "img_blue_marble.bmp"
+    convert_sample "img_earthrise.jpg"            "img_earthrise.bmp"
+    convert_sample "img_buzz_aldrin.jpg"          "img_buzz_aldrin.bmp"
+
+    # JPEG → PNG  (lossless deflate — sits between JPEG and raw)
+    convert_sample "img_blue_marble.jpg"          "img_blue_marble.png"
+    convert_sample "img_earthrise.jpg"            "img_earthrise.png"
+    convert_sample "img_buzz_aldrin.jpg"          "img_buzz_aldrin.png"
+
+    # OGG → WAV  (raw PCM, zero compression — compresses well)
+    convert_sample "audio_gettysburg.ogg"         "audio_gettysburg.wav"
+    convert_sample "audio_beethoven_5_mov1.ogg"   "audio_beethoven_5_mov1.wav"
+fi
