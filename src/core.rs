@@ -1,25 +1,40 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-// Block-based LZSS compressor.
+// Block-based LZSS with two improvements over v1:
+//
+// 1. Cross-block sliding window: the last WINDOW_SIZE bytes of raw output are carried
+//    as a history prefix into the next block's LZ search window. This lets the
+//    compressor find matches that straddle block boundaries.
+//
+// 2. Stride-2 delta filter (block type 2): before compressing, each byte is replaced
+//    by its difference from the byte two positions earlier — treating even/odd positions
+//    as independent streams. For 16-bit PCM audio this collapses high bytes to near-zero
+//    and reduces low-byte variance dramatically. Compressor tries both the raw and the
+//    delta-filtered path and picks whichever produces the smaller output.
 //
 // File format:
-//   [4B magic] [8B original_size: u64 LE]
-//   then blocks until EOF:
-//     [1B flag: 0=stored, 1=lzss] [4B raw_len: u32 LE] [4B comp_len: u32 LE] [comp_len bytes]
+//   [4B magic "LZC2"] [8B original_size u64 LE]
+//   blocks until EOF:
+//     [1B type: 0=stored, 1=lzss+history, 2=delta2+lzss]
+//     [4B raw_len u32 LE] [4B comp_len u32 LE] [comp_len bytes]
 //
-// LZSS token format inside a compressed block:
-//   cmd <= 0x80: literal run of `cmd` bytes (1..=128) follows
-//   cmd >= 0x81: back-reference; length = (cmd - 0x81) + MIN_MATCH,
-//                next 2 bytes = (offset - 1) as u16 LE
+// LZSS token format (types 1 and 2):
+//   cmd 0x01..=0x80: literal run of `cmd` bytes follows (1..=128 literals)
+//   cmd 0x81..=0xFF: back-reference; length = (cmd−0x81)+MIN_MATCH,
+//                    next 2 bytes = (offset−1) as u16 LE
 
-const MAGIC: [u8; 4] = *b"LZC1";
+const MAGIC: [u8; 4] = *b"LZC2";
 const BLOCK_SIZE: usize = 65536;
 const WINDOW_SIZE: usize = 65536;
 const HASH_BITS: usize = 16;
 const HASH_SIZE: usize = 1 << HASH_BITS;
-const MAX_MATCH: usize = 130; // 0x81 + 126 = 0xFF, so max (cmd - 0x81) = 126, length = 130
+const MAX_MATCH: usize = 130;
 const MIN_MATCH: usize = 4;
 const MAX_CHAIN: usize = 32;
+
+const BLOCK_STORED: u8 = 0;
+const BLOCK_LZSS: u8 = 1;
+const BLOCK_DELTA2_LZSS: u8 = 2;
 
 pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) -> io::Result<()> {
     let original_size = input.seek(SeekFrom::End(0))?;
@@ -29,24 +44,37 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
     output.write_all(&original_size.to_le_bytes())?;
 
     let mut in_buf = vec![0u8; BLOCK_SIZE];
+    let mut history: Vec<u8> = Vec::new();
+
     loop {
         let n = read_full(&mut input, &mut in_buf)?;
         if n == 0 {
             break;
         }
         let block = &in_buf[..n];
-        let compressed = lzss_compress(block);
 
-        let (flag, data): (u8, &[u8]) = if compressed.len() < block.len() {
-            (1, &compressed)
-        } else {
-            (0, block)
-        };
+        // Option A: LZSS with cross-block history
+        let comp_lzss = lzss_compress(&history, block);
+
+        // Option B: stride-2 delta filter + LZSS (self-contained, no cross-block history)
+        let delta_buf = delta2_encode(block);
+        let comp_delta = lzss_compress(&[], &delta_buf);
+
+        let (flag, data): (u8, &[u8]) =
+            if comp_lzss.len() <= comp_delta.len() && comp_lzss.len() < block.len() {
+                (BLOCK_LZSS, &comp_lzss)
+            } else if comp_delta.len() < block.len() {
+                (BLOCK_DELTA2_LZSS, &comp_delta)
+            } else {
+                (BLOCK_STORED, block)
+            };
 
         output.write_all(&[flag])?;
         output.write_all(&(block.len() as u32).to_le_bytes())?;
         output.write_all(&(data.len() as u32).to_le_bytes())?;
         output.write_all(data)?;
+
+        push_history(&mut history, block);
     }
 
     Ok(())
@@ -58,13 +86,12 @@ pub fn decompress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) 
     if magic != MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid magic"));
     }
-
     let mut buf8 = [0u8; 8];
     input.read_exact(&mut buf8)?;
-    // original_size is available here if needed for pre-allocation
 
     let mut flag_buf = [0u8; 1];
     let mut len_buf = [0u8; 4];
+    let mut history: Vec<u8> = Vec::new();
 
     loop {
         match input.read_exact(&mut flag_buf) {
@@ -80,15 +107,61 @@ pub fn decompress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) 
         let mut data = vec![0u8; comp_len];
         input.read_exact(&mut data)?;
 
-        if flag_buf[0] == 0 {
-            output.write_all(&data)?;
-        } else {
-            let decompressed = lzss_decompress(&data, raw_len)?;
-            output.write_all(&decompressed)?;
-        }
+        let block: Vec<u8> = match flag_buf[0] {
+            BLOCK_STORED => data,
+            BLOCK_LZSS => lzss_decompress(&history, &data, raw_len)?,
+            BLOCK_DELTA2_LZSS => {
+                let decoded = lzss_decompress(&[], &data, raw_len)?;
+                delta2_decode(decoded)
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown block type")),
+        };
+
+        push_history(&mut history, &block);
+        output.write_all(&block)?;
     }
 
     Ok(())
+}
+
+// Keep the last WINDOW_SIZE raw bytes for cross-block LZ history.
+fn push_history(history: &mut Vec<u8>, block: &[u8]) {
+    if block.len() >= WINDOW_SIZE {
+        history.clear();
+        history.extend_from_slice(&block[block.len() - WINDOW_SIZE..]);
+    } else {
+        let total = history.len() + block.len();
+        if total > WINDOW_SIZE {
+            history.drain(..total - WINDOW_SIZE);
+        }
+        history.extend_from_slice(block);
+    }
+}
+
+// Stride-2 delta: each byte stores its difference from the byte 2 positions earlier.
+// Even positions and odd positions are treated as independent byte streams.
+// This is highly effective for 16-bit PCM audio where adjacent samples correlate strongly.
+fn delta2_encode(input: &[u8]) -> Vec<u8> {
+    let n = input.len();
+    let mut out = vec![0u8; n];
+    if n > 0 {
+        out[0] = input[0];
+    }
+    if n > 1 {
+        out[1] = input[1];
+    }
+    for i in 2..n {
+        out[i] = input[i].wrapping_sub(input[i - 2]);
+    }
+    out
+}
+
+fn delta2_decode(mut data: Vec<u8>) -> Vec<u8> {
+    for i in 2..data.len() {
+        let prev = data[i - 2];
+        data[i] = data[i].wrapping_add(prev);
+    }
+    data
 }
 
 fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
@@ -110,43 +183,61 @@ fn hash4(b: &[u8], pos: usize) -> usize {
     (v.wrapping_mul(0x9E37_79B9) >> (32 - HASH_BITS)) as usize
 }
 
-fn lzss_compress(input: &[u8]) -> Vec<u8> {
+// Compress `input` using LZ77 with a sliding window seeded by `prefix`.
+// Back-references can reach into `prefix`, enabling cross-block matches when
+// prefix is the tail of the previous raw block.
+fn lzss_compress(prefix: &[u8], input: &[u8]) -> Vec<u8> {
+    let prefix_len = prefix.len();
     let n = input.len();
     let mut output = Vec::with_capacity(n / 2 + 16);
 
+    if n == 0 {
+        return output;
+    }
     if n < MIN_MATCH {
-        if n > 0 {
-            output.push(n as u8);
-            output.extend_from_slice(input);
-        }
+        output.push(n as u8);
+        output.extend_from_slice(input);
         return output;
     }
 
-    // head[h] = most recent position with hash h; prev[p] = previous position with same hash
-    let mut head = vec![u32::MAX; HASH_SIZE];
-    let mut prev = vec![u32::MAX; n];
+    let combined_len = prefix_len + n;
+    let mut combined = Vec::with_capacity(combined_len);
+    combined.extend_from_slice(prefix);
+    combined.extend_from_slice(input);
 
-    let mut pos = 0;
-    let mut lit_start = 0;
+    let mut head = vec![u32::MAX; HASH_SIZE];
+    let mut chain = vec![u32::MAX; combined_len];
+
+    // Seed hash table with prefix positions so the input can match against them.
+    for i in 0..prefix_len {
+        if i + MIN_MATCH <= combined_len {
+            let h = hash4(&combined, i);
+            chain[i] = head[h];
+            head[h] = i as u32;
+        }
+    }
+
+    let mut pos = prefix_len;
+    let mut lit_start = prefix_len;
     let mut lit_len: usize = 0;
 
-    while pos < n {
-        let (match_offset, match_len) = if pos + MIN_MATCH <= n {
-            let h = hash4(input, pos);
+    while pos < combined_len {
+        let (match_offset, match_len) = if pos + MIN_MATCH <= combined_len {
+            let h = hash4(&combined, pos);
 
             let mut best_len = 0usize;
             let mut best_offset = 0usize;
-            let mut chain_pos = head[h];
+            let mut cur = head[h];
             let mut depth = 0;
 
-            while chain_pos != u32::MAX && depth < MAX_CHAIN {
-                let cp = chain_pos as usize;
+            while cur != u32::MAX && depth < MAX_CHAIN {
+                let cp = cur as usize;
                 if pos - cp >= WINDOW_SIZE {
                     break;
                 }
-                let max_len = (n - pos).min(MAX_MATCH);
+                let max_len = (combined_len - pos).min(MAX_MATCH);
                 let mut ml = 0;
-                while ml < max_len && input[cp + ml] == input[pos + ml] {
+                while ml < max_len && combined[cp + ml] == combined[pos + ml] {
                     ml += 1;
                 }
                 if ml > best_len {
@@ -156,11 +247,11 @@ fn lzss_compress(input: &[u8]) -> Vec<u8> {
                         break;
                     }
                 }
-                chain_pos = prev[cp];
+                cur = chain[cp];
                 depth += 1;
             }
 
-            prev[pos] = head[h];
+            chain[pos] = head[h];
             head[h] = pos as u32;
 
             if best_len >= MIN_MATCH {
@@ -173,26 +264,24 @@ fn lzss_compress(input: &[u8]) -> Vec<u8> {
         };
 
         if match_len >= MIN_MATCH {
-            flush_literals(&mut output, input, lit_start, lit_len);
-            lit_len = 0;
-
-            // cmd byte 0x81..=0xFF encodes lengths MIN_MATCH..=MAX_MATCH
+            if lit_len > 0 {
+                flush_literals(&mut output, &combined, lit_start, lit_len);
+                lit_len = 0;
+            }
             let cmd = 0x81u8 + (match_len - MIN_MATCH) as u8;
             let off = (match_offset - 1) as u16;
             output.push(cmd);
             output.push(off as u8);
             output.push((off >> 8) as u8);
 
-            // Insert skipped positions into hash so they can anchor future matches
             for i in 1..match_len {
                 let p = pos + i;
-                if p + MIN_MATCH <= n {
-                    let h = hash4(input, p);
-                    prev[p] = head[h];
+                if p + MIN_MATCH <= combined_len {
+                    let h = hash4(&combined, p);
+                    chain[p] = head[h];
                     head[h] = p as u32;
                 }
             }
-
             pos += match_len;
         } else {
             if lit_len == 0 {
@@ -203,28 +292,35 @@ fn lzss_compress(input: &[u8]) -> Vec<u8> {
         }
     }
 
-    flush_literals(&mut output, input, lit_start, lit_len);
+    if lit_len > 0 {
+        flush_literals(&mut output, &combined, lit_start, lit_len);
+    }
     output
 }
 
-fn flush_literals(output: &mut Vec<u8>, input: &[u8], start: usize, len: usize) {
+fn flush_literals(output: &mut Vec<u8>, data: &[u8], start: usize, len: usize) {
     let mut remaining = len;
     let mut offset = start;
     while remaining > 0 {
         let chunk = remaining.min(128);
         output.push(chunk as u8);
-        output.extend_from_slice(&input[offset..offset + chunk]);
+        output.extend_from_slice(&data[offset..offset + chunk]);
         offset += chunk;
         remaining -= chunk;
     }
 }
 
-fn lzss_decompress(input: &[u8], expected_size: usize) -> io::Result<Vec<u8>> {
-    let mut output = Vec::with_capacity(expected_size);
-    let mut pos = 0;
+// Decompress a block. `prefix` (the raw history tail from previous blocks) is
+// prepended so that back-references into it resolve correctly.
+// Returns only the newly decompressed bytes, not the prefix.
+fn lzss_decompress(prefix: &[u8], data: &[u8], expected_size: usize) -> io::Result<Vec<u8>> {
+    let prefix_len = prefix.len();
+    let mut output = Vec::with_capacity(prefix_len + expected_size);
+    output.extend_from_slice(prefix);
 
-    while pos < input.len() {
-        let cmd = input[pos];
+    let mut pos = 0;
+    while pos < data.len() {
+        let cmd = data[pos];
         pos += 1;
 
         if cmd <= 0x80 {
@@ -232,17 +328,17 @@ fn lzss_decompress(input: &[u8], expected_size: usize) -> io::Result<Vec<u8>> {
             if count == 0 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "zero literal count"));
             }
-            if pos + count > input.len() {
+            if pos + count > data.len() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated literal run"));
             }
-            output.extend_from_slice(&input[pos..pos + count]);
+            output.extend_from_slice(&data[pos..pos + count]);
             pos += count;
         } else {
-            if pos + 2 > input.len() {
+            if pos + 2 > data.len() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated backref"));
             }
             let length = (cmd - 0x81) as usize + MIN_MATCH;
-            let offset = (input[pos] as usize) | ((input[pos + 1] as usize) << 8);
+            let offset = (data[pos] as usize) | ((data[pos + 1] as usize) << 8);
             let offset = offset + 1;
             pos += 2;
 
@@ -261,12 +357,13 @@ fn lzss_decompress(input: &[u8], expected_size: usize) -> io::Result<Vec<u8>> {
         }
     }
 
-    if output.len() != expected_size {
+    let new_len = output.len() - prefix_len;
+    if new_len != expected_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("size mismatch: got {} expected {}", output.len(), expected_size),
+            format!("size mismatch: got {} expected {}", new_len, expected_size),
         ));
     }
 
-    Ok(output)
+    Ok(output[prefix_len..].to_vec())
 }
