@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Only allowed files modified
+        run: |
+          changed=$(git diff --name-only origin/main...HEAD)
+          echo "Changed files:"
+          echo "$changed"
+          for file in $changed; do
+            case "$file" in
+              src/core.rs|results.csv) ;;
+              *) echo "Error: unexpected file modified: $file"; exit 1 ;;
+            esac
+          done
+
+      - name: Exactly one line added to results.csv
+        run: |
+          added=$(git diff origin/main...HEAD -- results.csv \
+            | grep '^+' | grep -v '^+++' | wc -l | tr -d ' ')
+          if [ "$added" -ne 1 ]; then
+            echo "Error: expected exactly 1 line added to results.csv, found $added"
+            exit 1
+          fi
+
+      - name: Branch names in results.csv are unique
+        run: |
+          branches=$(tail -n +2 results.csv | cut -d',' -f1 | grep -v '^$')
+          total=$(echo "$branches" | wc -l | tr -d ' ')
+          unique=$(echo "$branches" | sort -u | wc -l | tr -d ' ')
+          if [ "$total" -ne "$unique" ]; then
+            echo "Error: duplicate branch names in results.csv"
+            echo "$branches" | sort | uniq -d | sed 's/^/  /'
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust tests pass
+        run: cargo test

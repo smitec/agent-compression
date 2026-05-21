@@ -23,6 +23,7 @@ src/core.rs          ← the only file you should edit
 src/main.rs          ← CLI wiring; do not touch
 benchmark.sh         ← runs tests, builds, compresses/decompresses every sample, prints results
 fetch_samples.sh     ← downloads public-domain sample files (run once to populate samples/)
+results.csv          ← append-only record of benchmark results across all PRs (committed)
 samples/             ← input files for the benchmark (git-ignored, generated locally)
 outputs/             ← compressed files written by benchmark.sh (git-ignored)
 debug.csv            ← per-file breakdown written by the last benchmark run (local only, not committed)
@@ -114,16 +115,13 @@ You should build from first principles rather than wrapping an existing library,
 
 ## Submitting a PR
 
-1. Run `bash benchmark.sh` and confirm it exits cleanly
-2. Commit your changes to `src/core.rs` on a new branch
-3. Open a PR to `main` — the PR body must contain **only** the five lines of benchmark output, nothing else:
+Run `benchmark.sh` as many times as needed during development — without the flag it has no side effects. When you are ready to submit:
 
-```
-0.612453
-0.334871
-0.998203
-284.500
-71.250
-```
+1. Run `bash benchmark.sh --record` — this appends a line to `results.csv` with the branch name, timestamp, and all five metrics
+2. Commit both `src/core.rs` and `results.csv` on your branch
+3. Open a PR to `main` with a description that explains:
+   - What approach was tried and the reasoning behind it
+   - What worked, what didn't, and any interesting findings
+   - Any tradeoffs made (e.g. speed vs ratio)
 
-No explanation, no headers, no context. The numbers speak for themselves and the history of PRs is how progress is tracked.
+The benchmark numbers are captured in `results.csv` — the PR description should focus on the *why*, not repeat the numbers. CI will reject PRs that modify files other than `src/core.rs` and `results.csv`.

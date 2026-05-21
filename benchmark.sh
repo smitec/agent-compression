@@ -6,6 +6,10 @@ SAMPLES_DIR="samples"
 OUTPUTS_DIR="outputs"
 TIMEOUT_SECS=300
 EXPANSION_LIMIT=1.5   # fail if compressed output exceeds original by this factor
+RESULTS_CSV="results.csv"
+
+RECORD=false
+[ "${1:-}" = "--record" ] && RECORD=true
 
 cargo test >&2
 cargo build --release >&2
@@ -146,12 +150,24 @@ if [ "$count" -eq 0 ]; then
     exit 1
 fi
 
-awk "BEGIN { printf \"%.6f\n\", $total_comp_bytes / $total_orig_bytes }"
-[ "$compressible_orig_bytes"  -gt 0 ] \
-    && awk "BEGIN { printf \"%.6f\n\", $compressible_comp_bytes  / $compressible_orig_bytes  }" \
-    || echo "N/A"
-[ "$already_comp_orig_bytes" -gt 0 ] \
-    && awk "BEGIN { printf \"%.6f\n\", $already_comp_comp_bytes / $already_comp_orig_bytes }" \
-    || echo "N/A"
-awk "BEGIN { printf \"%.3f\n\", $total_compress_ms   / $count }"
-awk "BEGIN { printf \"%.3f\n\", $total_decompress_ms / $count }"
+overall_ratio=$(awk "BEGIN { printf \"%.6f\", $total_comp_bytes / $total_orig_bytes }")
+compressible_ratio=$([ "$compressible_orig_bytes" -gt 0 ] \
+    && awk "BEGIN { printf \"%.6f\", $compressible_comp_bytes / $compressible_orig_bytes }" \
+    || echo "N/A")
+already_ratio=$([ "$already_comp_orig_bytes" -gt 0 ] \
+    && awk "BEGIN { printf \"%.6f\", $already_comp_comp_bytes / $already_comp_orig_bytes }" \
+    || echo "N/A")
+avg_compress_ms=$(awk "BEGIN { printf \"%.3f\", $total_compress_ms   / $count }")
+avg_decompress_ms=$(awk "BEGIN { printf \"%.3f\", $total_decompress_ms / $count }")
+
+echo "$overall_ratio"
+echo "$compressible_ratio"
+echo "$already_ratio"
+echo "$avg_compress_ms"
+echo "$avg_decompress_ms"
+
+if [ "$RECORD" = "true" ]; then
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    datetime=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    echo "$branch,$datetime,$overall_ratio,$compressible_ratio,$already_ratio,$avg_compress_ms,$avg_decompress_ms" >> "$RESULTS_CSV"
+fi
