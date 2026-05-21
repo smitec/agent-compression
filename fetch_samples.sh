@@ -57,6 +57,10 @@ fetch "audio_gettysburg.ogg"          "https://upload.wikimedia.org/wikipedia/co
 fetch "audio_gettysburg_librivox.ogg" "https://upload.wikimedia.org/wikipedia/commons/3/30/LibriVox_-_Everrett_Copy_of_the_Gettysburg_Address_-_Michael_Scherer.ogg"
 fetch "audio_bach_toccata.flac"       "https://upload.wikimedia.org/wikipedia/commons/2/20/PDP-CH_-_Philadelphia_Orchestra%2C_Leopold_Stokowski_-_Toccata_and_Fugue_in_D_minor%2C_BWV_565_-_Bach_-_Hmv-d1428-5-0761.flac"  # ~166 MB
 
+# ── Structured data — public domain, uncompressed text formats ─────────────────────────────────
+fetch "data_gutenberg_catalog.csv"    "https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv"  # ~3 MB
+fetch "data_usgs_earthquakes.json"    "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_month.geojson"  # ~7 MB
+
 # ── Video — Internet Archive (CC-licensed short films, H.264 MP4) ──────────────────────────────
 # Already compressed; expect ratio ≈ 1.0 on these.
 fetch "video_elephants_dream.mp4"     "https://archive.org/download/ElephantsDream/ed_1024_512kb.mp4"          # ~47 MB  (CC BY)
