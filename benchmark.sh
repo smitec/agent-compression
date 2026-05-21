@@ -15,6 +15,9 @@ mkdir -p "$OUTPUTS_DIR"
 [ -f "$SAMPLES_DIR/random_10mb.bin"  ] || dd if=/dev/urandom of="$SAMPLES_DIR/random_10mb.bin"  bs=1048576 count=10  2>/dev/null
 [ -f "$SAMPLES_DIR/random_100mb.bin" ] || dd if=/dev/urandom of="$SAMPLES_DIR/random_100mb.bin" bs=1048576 count=100 2>/dev/null
 
+DEBUG_CSV="debug.csv"
+echo "filename,original_bytes,compressed_bytes,ratio,compress_ms,decompress_ms" > "$DEBUG_CSV"
+
 tmpdir=$(mktemp -d)
 trap "rm -rf '$tmpdir'" EXIT
 
@@ -87,6 +90,8 @@ for input_file in "$SAMPLES_DIR"/*; do
 
     ratio=$(awk "BEGIN { print $compressed_size / $original_size }")
     total_ratio=$(awk "BEGIN { print $total_ratio + $ratio }")
+
+    echo "$filename,$original_size,$compressed_size,$ratio,$((t1 - t0)),$((t2 - t1))" >> "$DEBUG_CSV"
     total_compress_ms=$((total_compress_ms + t1 - t0))
     total_decompress_ms=$((total_decompress_ms + t2 - t1))
     count=$((count + 1))
