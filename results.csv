@@ -1,3 +1,4 @@
 branch,datetime,overall_ratio,compressible_ratio,already_compressed_ratio,avg_compress_ms,avg_decompress_ms
 stub,2026-05-21T01:06:17Z,1.000000,1.000000,1.000000,66.773,48.886
 lzss-v1,2026-05-21T10:40:45Z,0.961035,0.945150,0.999425,355.136,42.409
+lzss-v2,2026-05-21T10:56:59Z,0.948125,0.926935,0.999336,1036.773,61.591
