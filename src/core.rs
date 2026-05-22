@@ -18,6 +18,15 @@ const BLOCK_LZSS_HUF: u8 = 3;
 const BLOCK_DELTA2_LZSS_HUF: u8 = 4;
 const BLOCK_DELTA1_LZSS: u8 = 5;
 const BLOCK_DELTA1_LZSS_HUF: u8 = 6;
+const BLOCK_LZSS_HUF3: u8 = 7;
+const BLOCK_DELTA1_LZSS_HUF3: u8 = 8;
+const BLOCK_DELTA2_LZSS_HUF3: u8 = 9;
+const BLOCK_DELTA3_LZSS: u8 = 10;
+const BLOCK_DELTA3_LZSS_HUF: u8 = 11;
+const BLOCK_DELTA3_LZSS_HUF3: u8 = 12;
+const BLOCK_DELTA4_LZSS: u8 = 13;
+const BLOCK_DELTA4_LZSS_HUF: u8 = 14;
+const BLOCK_DELTA4_LZSS_HUF3: u8 = 15;
 
 // ── BitWriter ────────────────────────────────────────────────────────────────
 
@@ -232,39 +241,24 @@ fn huffman_decode(data: &[u8]) -> io::Result<Vec<u8>> {
 
 // ── Delta filters ────────────────────────────────────────────────────────────
 
-fn delta1_encode(input: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; input.len()];
-    if !input.is_empty() { out[0] = input[0]; }
-    for i in 1..input.len() {
-        out[i] = input[i].wrapping_sub(input[i - 1]);
-    }
-    out
-}
-
-fn delta1_decode(mut data: Vec<u8>) -> Vec<u8> {
-    for i in 1..data.len() {
-        let prev = data[i - 1];
-        data[i] = data[i].wrapping_add(prev);
-    }
-    data
-}
-
-fn delta2_encode(input: &[u8]) -> Vec<u8> {
+fn delta_n_encode(input: &[u8], stride: usize) -> Vec<u8> {
     let n = input.len();
     let mut out = vec![0u8; n];
-    if n > 0 { out[0] = input[0]; }
-    if n > 1 { out[1] = input[1]; }
-    for i in 2..n { out[i] = input[i].wrapping_sub(input[i - 2]); }
+    for i in 0..stride.min(n) { out[i] = input[i]; }
+    for i in stride..n { out[i] = input[i].wrapping_sub(input[i - stride]); }
     out
 }
 
-fn delta2_decode(mut data: Vec<u8>) -> Vec<u8> {
-    for i in 2..data.len() {
-        let prev = data[i - 2];
+fn delta_n_decode(mut data: Vec<u8>, stride: usize) -> Vec<u8> {
+    for i in stride..data.len() {
+        let prev = data[i - stride];
         data[i] = data[i].wrapping_add(prev);
     }
     data
 }
+
+fn delta1_decode(data: Vec<u8>) -> Vec<u8> { delta_n_decode(data, 1) }
+fn delta2_decode(data: Vec<u8>) -> Vec<u8> { delta_n_decode(data, 2) }
 
 fn estimate_entropy(data: &[u8]) -> f32 {
     let mut freq = [0u32; 256];
@@ -387,25 +381,39 @@ fn lzss_compress(prefix: &[u8], input: &[u8]) -> Vec<u8> {
         let (mo, ml) = find_best_match_at(&combined, pos, combined_len, &mut head, &mut chain);
 
         if ml >= MIN_MATCH {
-            // Lazy matching: peek at pos+1 for a potentially better match.
+            // Lazy matching: peek up to 2 positions ahead for a better match.
             if ml < MAX_MATCH && pos + 1 + MIN_MATCH <= combined_len {
                 let (lo, ll) = find_best_match_at(&combined, pos + 1, combined_len, &mut head, &mut chain);
                 if ll > ml {
-                    // Better match at pos+1: emit pos as literal, use lazy match.
+                    // pos+1 has a better match; check pos+2 for an even better one.
+                    let mut use_off = lo;
+                    let mut use_len = ll;
+                    let mut skip = 1usize; // literals to emit before the match
+
+                    if ll < MAX_MATCH && pos + 2 + MIN_MATCH <= combined_len {
+                        let (lo2, ll2) = find_best_match_at(&combined, pos + 2, combined_len, &mut head, &mut chain);
+                        if ll2 > ll {
+                            use_off = lo2;
+                            use_len = ll2;
+                            skip = 2;
+                        }
+                        // pos+2 now inserted in the hash table regardless.
+                    }
+
                     if lit_len == 0 { lit_start = pos; }
-                    lit_len += 1;
-                    pos += 1;
+                    lit_len += skip;
+                    pos += skip;
 
                     flush_literals(&mut output, &combined, lit_start, lit_len);
                     lit_len = 0;
 
-                    let cmd = 0x81u8 + (ll - MIN_MATCH) as u8;
-                    let off = (lo - 1) as u16;
+                    let cmd = 0x81u8 + (use_len - MIN_MATCH) as u8;
+                    let off = (use_off - 1) as u16;
                     output.push(cmd);
                     output.push(off as u8);
                     output.push((off >> 8) as u8);
 
-                    for i in 1..ll {
+                    for i in 1..use_len {
                         let p = pos + i;
                         if p + MIN_MATCH <= combined_len {
                             let h = hash4(&combined, p);
@@ -413,7 +421,7 @@ fn lzss_compress(prefix: &[u8], input: &[u8]) -> Vec<u8> {
                             head[h] = p as u32;
                         }
                     }
-                    pos += ll;
+                    pos += use_len;
                     continue;
                 }
                 // pos+1 already inserted by the lazy probe; continue with original match.
@@ -516,22 +524,124 @@ fn lzss_decompress(prefix: &[u8], data: &[u8], expected_size: usize) -> io::Resu
 // ── Delta candidate selection ─────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
-enum DeltaMode { None, Delta1, Delta2 }
+enum DeltaMode { None, Delta1, Delta2, Delta3, Delta4 }
 
 fn select_delta(block: &[u8]) -> (DeltaMode, Vec<u8>) {
     let e_raw = estimate_entropy(block);
-    let d1 = delta1_encode(block);
-    let d2 = delta2_encode(block);
-    let e1 = estimate_entropy(&d1);
-    let e2 = estimate_entropy(&d2);
     let threshold = e_raw - 0.05;
-    if e1 <= e2 && e1 < threshold {
-        (DeltaMode::Delta1, d1)
-    } else if e2 < threshold {
-        (DeltaMode::Delta2, d2)
-    } else {
-        (DeltaMode::None, Vec::new())
+
+    let candidates: [(DeltaMode, Vec<u8>); 4] = [
+        (DeltaMode::Delta1, delta_n_encode(block, 1)),
+        (DeltaMode::Delta2, delta_n_encode(block, 2)),
+        (DeltaMode::Delta3, delta_n_encode(block, 3)),
+        (DeltaMode::Delta4, delta_n_encode(block, 4)),
+    ];
+
+    let mut best_entropy = threshold;
+    let mut best_idx: Option<usize> = None;
+
+    for i in 0..candidates.len() {
+        let e = estimate_entropy(&candidates[i].1);
+        if e < best_entropy {
+            best_entropy = e;
+            best_idx = Some(i);
+        }
     }
+
+    match best_idx {
+        Some(i) => {
+            let mut arr = candidates.into_iter();
+            arr.nth(i).unwrap()
+        }
+        None => (DeltaMode::None, Vec::new()),
+    }
+}
+
+// ── 3-Stream Huffman ──────────────────────────────────────────────────────────
+
+// Splits the LZSS byte stream into cmd/literal/offset streams and Huffman-codes each.
+// Wire format: [4B cmds_huf_len][4B lits_huf_len][cmds_huf][lits_huf][offs_huf]
+fn lzss_huf3_encode(lzss_data: &[u8]) -> Vec<u8> {
+    if lzss_data.is_empty() { return Vec::new(); }
+
+    let mut cmds = Vec::new();
+    let mut lits = Vec::new();
+    let mut offs = Vec::new();
+
+    let mut pos = 0;
+    while pos < lzss_data.len() {
+        let cmd = lzss_data[pos];
+        pos += 1;
+        cmds.push(cmd);
+        if cmd <= 0x80 {
+            let count = cmd as usize;
+            lits.extend_from_slice(&lzss_data[pos..pos + count]);
+            pos += count;
+        } else {
+            offs.push(lzss_data[pos]);
+            offs.push(lzss_data[pos + 1]);
+            pos += 2;
+        }
+    }
+
+    let cmds_huf = huffman_encode(&cmds);
+    let lits_huf = if lits.is_empty() { Vec::new() } else { huffman_encode(&lits) };
+    let offs_huf = if offs.is_empty() { Vec::new() } else { huffman_encode(&offs) };
+
+    let mut out = Vec::with_capacity(8 + cmds_huf.len() + lits_huf.len() + offs_huf.len());
+    out.extend_from_slice(&(cmds_huf.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(lits_huf.len() as u32).to_le_bytes());
+    out.extend(cmds_huf);
+    out.extend(lits_huf);
+    out.extend(offs_huf);
+    out
+}
+
+fn lzss_huf3_decode(data: &[u8]) -> io::Result<Vec<u8>> {
+    if data.is_empty() { return Ok(Vec::new()); }
+    if data.len() < 8 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "huf3 block too short"));
+    }
+
+    let cmds_huf_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let lits_huf_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+
+    if 8 + cmds_huf_len + lits_huf_len > data.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "huf3 section lengths overflow"));
+    }
+
+    let cmds_section = &data[8..8 + cmds_huf_len];
+    let lits_section = &data[8 + cmds_huf_len..8 + cmds_huf_len + lits_huf_len];
+    let offs_section = &data[8 + cmds_huf_len + lits_huf_len..];
+
+    let cmds = huffman_decode(cmds_section)?;
+    let lits = if lits_huf_len == 0 { Vec::new() } else { huffman_decode(lits_section)? };
+    let offs = if offs_section.is_empty() { Vec::new() } else { huffman_decode(offs_section)? };
+
+    let mut out = Vec::new();
+    let mut lits_pos = 0usize;
+    let mut offs_pos = 0usize;
+
+    for &cmd in &cmds {
+        out.push(cmd);
+        if cmd <= 0x80 {
+            let count = cmd as usize;
+            if lits_pos + count > lits.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "huf3 lits truncated"));
+            }
+            out.extend_from_slice(&lits[lits_pos..lits_pos + count]);
+            lits_pos += count;
+        } else {
+            if offs_pos + 2 > offs.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "huf3 offs truncated"));
+            }
+            out.push(offs[offs_pos]);
+            out.push(offs[offs_pos + 1]);
+            offs_pos += 2;
+        }
+    }
+
+    Ok(out)
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -551,18 +661,20 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
         if n == 0 { break; }
         let block = &in_buf[..n];
 
-        // Candidate A: LZSS with cross-block history (± Huffman).
+        // Candidate A: LZSS with cross-block history (± single-tree Huffman ± 3-stream Huffman).
         let comp_lzss = lzss_compress(&history, block);
         let comp_lzss_huf = huffman_encode(&comp_lzss);
+        let comp_lzss_huf3 = lzss_huf3_encode(&comp_lzss);
 
-        // Candidate B: best delta + LZSS (self-contained, ± Huffman).
+        // Candidate B: best delta + LZSS (self-contained, ± Huffman variants).
         let (delta_mode, delta_buf) = select_delta(block);
-        let (comp_delta, comp_delta_huf) = if !matches!(delta_mode, DeltaMode::None) {
+        let (comp_delta, comp_delta_huf, comp_delta_huf3) = if !matches!(delta_mode, DeltaMode::None) {
             let cd = lzss_compress(&[], &delta_buf);
             let cdh = huffman_encode(&cd);
-            (cd, cdh)
+            let cdh3 = lzss_huf3_encode(&cd);
+            (cd, cdh, cdh3)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
 
         // Pick the smallest.
@@ -576,26 +688,39 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
         }
 
         consider!(comp_lzss.len(), BLOCK_LZSS);
-        if !comp_lzss_huf.is_empty() { consider!(comp_lzss_huf.len(), BLOCK_LZSS_HUF); }
+        if !comp_lzss_huf.is_empty()  { consider!(comp_lzss_huf.len(),  BLOCK_LZSS_HUF); }
+        if !comp_lzss_huf3.is_empty() { consider!(comp_lzss_huf3.len(), BLOCK_LZSS_HUF3); }
         if !comp_delta.is_empty() {
-            let (df, dhf) = match delta_mode {
-                DeltaMode::Delta1 => (BLOCK_DELTA1_LZSS, BLOCK_DELTA1_LZSS_HUF),
-                DeltaMode::Delta2 => (BLOCK_DELTA2_LZSS, BLOCK_DELTA2_LZSS_HUF),
+            let (df, dhf, dhf3) = match delta_mode {
+                DeltaMode::Delta1 => (BLOCK_DELTA1_LZSS, BLOCK_DELTA1_LZSS_HUF, BLOCK_DELTA1_LZSS_HUF3),
+                DeltaMode::Delta2 => (BLOCK_DELTA2_LZSS, BLOCK_DELTA2_LZSS_HUF, BLOCK_DELTA2_LZSS_HUF3),
+                DeltaMode::Delta3 => (BLOCK_DELTA3_LZSS, BLOCK_DELTA3_LZSS_HUF, BLOCK_DELTA3_LZSS_HUF3),
+                DeltaMode::Delta4 => (BLOCK_DELTA4_LZSS, BLOCK_DELTA4_LZSS_HUF, BLOCK_DELTA4_LZSS_HUF3),
                 DeltaMode::None   => unreachable!(),
             };
             consider!(comp_delta.len(), df);
-            if !comp_delta_huf.is_empty() { consider!(comp_delta_huf.len(), dhf); }
+            if !comp_delta_huf.is_empty()  { consider!(comp_delta_huf.len(),  dhf); }
+            if !comp_delta_huf3.is_empty() { consider!(comp_delta_huf3.len(), dhf3); }
         }
 
         let data: &[u8] = match best_type {
-            BLOCK_STORED           => block,
-            BLOCK_LZSS             => &comp_lzss,
-            BLOCK_LZSS_HUF         => &comp_lzss_huf,
-            BLOCK_DELTA1_LZSS      => &comp_delta,
-            BLOCK_DELTA2_LZSS      => &comp_delta,
-            BLOCK_DELTA1_LZSS_HUF  => &comp_delta_huf,
-            BLOCK_DELTA2_LZSS_HUF  => &comp_delta_huf,
-            _                      => block,
+            BLOCK_STORED            => block,
+            BLOCK_LZSS              => &comp_lzss,
+            BLOCK_LZSS_HUF          => &comp_lzss_huf,
+            BLOCK_LZSS_HUF3         => &comp_lzss_huf3,
+            BLOCK_DELTA1_LZSS       => &comp_delta,
+            BLOCK_DELTA2_LZSS       => &comp_delta,
+            BLOCK_DELTA3_LZSS       => &comp_delta,
+            BLOCK_DELTA4_LZSS       => &comp_delta,
+            BLOCK_DELTA1_LZSS_HUF   => &comp_delta_huf,
+            BLOCK_DELTA2_LZSS_HUF   => &comp_delta_huf,
+            BLOCK_DELTA3_LZSS_HUF   => &comp_delta_huf,
+            BLOCK_DELTA4_LZSS_HUF   => &comp_delta_huf,
+            BLOCK_DELTA1_LZSS_HUF3  => &comp_delta_huf3,
+            BLOCK_DELTA2_LZSS_HUF3  => &comp_delta_huf3,
+            BLOCK_DELTA3_LZSS_HUF3  => &comp_delta_huf3,
+            BLOCK_DELTA4_LZSS_HUF3  => &comp_delta_huf3,
+            _                       => block,
         };
 
         output.write_all(&[best_type])?;
@@ -660,6 +785,48 @@ pub fn decompress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) 
                 let lzss_bytes = huffman_decode(&data)?;
                 let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
                 delta1_decode(decoded)
+            }
+            BLOCK_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                lzss_decompress(&history, &lzss_bytes, raw_len)?
+            }
+            BLOCK_DELTA1_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_n_decode(decoded, 1)
+            }
+            BLOCK_DELTA2_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_n_decode(decoded, 2)
+            }
+            BLOCK_DELTA3_LZSS => {
+                let decoded = lzss_decompress(&[], &data, raw_len)?;
+                delta_n_decode(decoded, 3)
+            }
+            BLOCK_DELTA3_LZSS_HUF => {
+                let lzss_bytes = huffman_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_n_decode(decoded, 3)
+            }
+            BLOCK_DELTA3_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_n_decode(decoded, 3)
+            }
+            BLOCK_DELTA4_LZSS => {
+                let decoded = lzss_decompress(&[], &data, raw_len)?;
+                delta_n_decode(decoded, 4)
+            }
+            BLOCK_DELTA4_LZSS_HUF => {
+                let lzss_bytes = huffman_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_n_decode(decoded, 4)
+            }
+            BLOCK_DELTA4_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_n_decode(decoded, 4)
             }
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown block type")),
         };
