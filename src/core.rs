@@ -27,6 +27,10 @@ const BLOCK_DELTA3_LZSS_HUF3: u8 = 12;
 const BLOCK_DELTA4_LZSS: u8 = 13;
 const BLOCK_DELTA4_LZSS_HUF: u8 = 14;
 const BLOCK_DELTA4_LZSS_HUF3: u8 = 15;
+const BLOCK_DELTA1_O2_LZSS_HUF3:  u8 = 16;
+const BLOCK_DELTA4_O2_LZSS_HUF3:  u8 = 17;
+const BLOCK_LSIDE_D4_LZSS_HUF3:   u8 = 18;
+const BLOCK_LSIDE_D4O2_LZSS_HUF3: u8 = 19;
 
 // ── BitWriter ────────────────────────────────────────────────────────────────
 
@@ -259,6 +263,55 @@ fn delta_n_decode(mut data: Vec<u8>, stride: usize) -> Vec<u8> {
 
 fn delta1_decode(data: Vec<u8>) -> Vec<u8> { delta_n_decode(data, 1) }
 fn delta2_decode(data: Vec<u8>) -> Vec<u8> { delta_n_decode(data, 2) }
+
+fn delta_n_order2_encode(input: &[u8], stride: usize) -> Vec<u8> {
+    let n = input.len();
+    let mut out = vec![0u8; n];
+    for i in 0..stride.min(n) { out[i] = input[i]; }
+    for i in stride..(2 * stride).min(n) {
+        out[i] = input[i].wrapping_sub(input[i - stride]);
+    }
+    for i in (2 * stride)..n {
+        let pred = (2u16 * input[i - stride] as u16)
+            .wrapping_sub(input[i - 2 * stride] as u16) as u8;
+        out[i] = input[i].wrapping_sub(pred);
+    }
+    out
+}
+
+fn delta_n_order2_decode(mut data: Vec<u8>, stride: usize) -> Vec<u8> {
+    let n = data.len();
+    for i in stride..(2 * stride).min(n) {
+        data[i] = data[i].wrapping_add(data[i - stride]);
+    }
+    for i in (2 * stride)..n {
+        let pred = (2u16 * data[i - stride] as u16)
+            .wrapping_sub(data[i - 2 * stride] as u16) as u8;
+        data[i] = data[i].wrapping_add(pred);
+    }
+    data
+}
+
+fn leftside_encode(data: &[u8]) -> Vec<u8> {
+    let mut out = data.to_vec();
+    let mut i = 0;
+    while i + 3 < data.len() {
+        out[i + 2] = data[i + 2].wrapping_sub(data[i]);
+        out[i + 3] = data[i + 3].wrapping_sub(data[i + 1]);
+        i += 4;
+    }
+    out
+}
+
+fn leftside_decode(mut data: Vec<u8>) -> Vec<u8> {
+    let mut i = 0;
+    while i + 3 < data.len() {
+        data[i + 2] = data[i + 2].wrapping_add(data[i]);
+        data[i + 3] = data[i + 3].wrapping_add(data[i + 1]);
+        i += 4;
+    }
+    data
+}
 
 fn estimate_entropy(data: &[u8]) -> f32 {
     let mut freq = [0u32; 256];
@@ -521,27 +574,40 @@ fn lzss_decompress(prefix: &[u8], data: &[u8], expected_size: usize) -> io::Resu
     Ok(output[prefix_len..].to_vec())
 }
 
-// ── Delta candidate selection ─────────────────────────────────────────────────
+// ── Delta / predictor candidate selection ────────────────────────────────────
 
 #[derive(Clone, Copy)]
-enum DeltaMode { None, Delta1, Delta2, Delta3, Delta4 }
+enum DeltaMode {
+    None,
+    Delta1, Delta2, Delta3, Delta4,
+    Delta1O2, Delta4O2,
+    LsideD4, LsideD4O2,
+}
 
-fn select_delta(block: &[u8]) -> (DeltaMode, Vec<u8>) {
+fn select_predictor(block: &[u8]) -> (DeltaMode, Vec<u8>) {
     let e_raw = estimate_entropy(block);
     let threshold = e_raw - 0.05;
 
-    let candidates: [(DeltaMode, Vec<u8>); 4] = [
-        (DeltaMode::Delta1, delta_n_encode(block, 1)),
-        (DeltaMode::Delta2, delta_n_encode(block, 2)),
-        (DeltaMode::Delta3, delta_n_encode(block, 3)),
-        (DeltaMode::Delta4, delta_n_encode(block, 4)),
+    let mut candidates: Vec<(DeltaMode, Vec<u8>)> = vec![
+        (DeltaMode::Delta1,   delta_n_encode(block, 1)),
+        (DeltaMode::Delta2,   delta_n_encode(block, 2)),
+        (DeltaMode::Delta3,   delta_n_encode(block, 3)),
+        (DeltaMode::Delta4,   delta_n_encode(block, 4)),
+        (DeltaMode::Delta1O2, delta_n_order2_encode(block, 1)),
+        (DeltaMode::Delta4O2, delta_n_order2_encode(block, 4)),
     ];
+
+    if block.len() % 4 == 0 {
+        let ls = leftside_encode(block);
+        candidates.push((DeltaMode::LsideD4,   delta_n_encode(&ls, 4)));
+        candidates.push((DeltaMode::LsideD4O2, delta_n_order2_encode(&ls, 4)));
+    }
 
     let mut best_entropy = threshold;
     let mut best_idx: Option<usize> = None;
 
-    for i in 0..candidates.len() {
-        let e = estimate_entropy(&candidates[i].1);
+    for (i, (_, buf)) in candidates.iter().enumerate() {
+        let e = estimate_entropy(buf);
         if e < best_entropy {
             best_entropy = e;
             best_idx = Some(i);
@@ -549,10 +615,7 @@ fn select_delta(block: &[u8]) -> (DeltaMode, Vec<u8>) {
     }
 
     match best_idx {
-        Some(i) => {
-            let mut arr = candidates.into_iter();
-            arr.nth(i).unwrap()
-        }
+        Some(i) => candidates.swap_remove(i),
         None => (DeltaMode::None, Vec::new()),
     }
 }
@@ -666,16 +729,19 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
         let comp_lzss_huf = huffman_encode(&comp_lzss);
         let comp_lzss_huf3 = lzss_huf3_encode(&comp_lzss);
 
-        // Candidate B: best delta + LZSS (self-contained, ± Huffman variants).
-        let (delta_mode, delta_buf) = select_delta(block);
-        let (comp_delta, comp_delta_huf, comp_delta_huf3) = if !matches!(delta_mode, DeltaMode::None) {
-            let cd = lzss_compress(&[], &delta_buf);
-            let cdh = huffman_encode(&cd);
-            let cdh3 = lzss_huf3_encode(&cd);
-            (cd, cdh, cdh3)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
+        // Candidate B: best predictor + LZSS (self-contained, ± Huffman variants).
+        let (delta_mode, delta_buf) = select_predictor(block);
+        let (comp_delta, comp_delta_huf, comp_delta_huf3) =
+            if matches!(delta_mode, DeltaMode::Delta1 | DeltaMode::Delta2 |
+                                    DeltaMode::Delta3 | DeltaMode::Delta4)
+            {
+                let cd = lzss_compress(&[], &delta_buf);
+                let cdh = huffman_encode(&cd);
+                let cdh3 = lzss_huf3_encode(&cd);
+                (cd, cdh, cdh3)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
 
         // Pick the smallest.
         let mut best_len = block.len();
@@ -696,31 +762,54 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
                 DeltaMode::Delta2 => (BLOCK_DELTA2_LZSS, BLOCK_DELTA2_LZSS_HUF, BLOCK_DELTA2_LZSS_HUF3),
                 DeltaMode::Delta3 => (BLOCK_DELTA3_LZSS, BLOCK_DELTA3_LZSS_HUF, BLOCK_DELTA3_LZSS_HUF3),
                 DeltaMode::Delta4 => (BLOCK_DELTA4_LZSS, BLOCK_DELTA4_LZSS_HUF, BLOCK_DELTA4_LZSS_HUF3),
-                DeltaMode::None   => unreachable!(),
+                _                 => unreachable!(),
             };
             consider!(comp_delta.len(), df);
             if !comp_delta_huf.is_empty()  { consider!(comp_delta_huf.len(),  dhf); }
             if !comp_delta_huf3.is_empty() { consider!(comp_delta_huf3.len(), dhf3); }
         }
 
+        // Candidate C: new-predictor modes (HUF3 only, no cross-block history).
+        let mut comp_new_huf3: Vec<u8> = Vec::new();
+        if matches!(delta_mode, DeltaMode::Delta1O2 | DeltaMode::Delta4O2 |
+                                DeltaMode::LsideD4  | DeltaMode::LsideD4O2)
+        {
+            let cd = lzss_compress(&[], &delta_buf);
+            comp_new_huf3 = lzss_huf3_encode(&cd);
+            if !comp_new_huf3.is_empty() {
+                let flag = match delta_mode {
+                    DeltaMode::Delta1O2  => BLOCK_DELTA1_O2_LZSS_HUF3,
+                    DeltaMode::Delta4O2  => BLOCK_DELTA4_O2_LZSS_HUF3,
+                    DeltaMode::LsideD4   => BLOCK_LSIDE_D4_LZSS_HUF3,
+                    DeltaMode::LsideD4O2 => BLOCK_LSIDE_D4O2_LZSS_HUF3,
+                    _                    => unreachable!(),
+                };
+                consider!(comp_new_huf3.len(), flag);
+            }
+        }
+
         let data: &[u8] = match best_type {
-            BLOCK_STORED            => block,
-            BLOCK_LZSS              => &comp_lzss,
-            BLOCK_LZSS_HUF          => &comp_lzss_huf,
-            BLOCK_LZSS_HUF3         => &comp_lzss_huf3,
-            BLOCK_DELTA1_LZSS       => &comp_delta,
-            BLOCK_DELTA2_LZSS       => &comp_delta,
-            BLOCK_DELTA3_LZSS       => &comp_delta,
-            BLOCK_DELTA4_LZSS       => &comp_delta,
-            BLOCK_DELTA1_LZSS_HUF   => &comp_delta_huf,
-            BLOCK_DELTA2_LZSS_HUF   => &comp_delta_huf,
-            BLOCK_DELTA3_LZSS_HUF   => &comp_delta_huf,
-            BLOCK_DELTA4_LZSS_HUF   => &comp_delta_huf,
-            BLOCK_DELTA1_LZSS_HUF3  => &comp_delta_huf3,
-            BLOCK_DELTA2_LZSS_HUF3  => &comp_delta_huf3,
-            BLOCK_DELTA3_LZSS_HUF3  => &comp_delta_huf3,
-            BLOCK_DELTA4_LZSS_HUF3  => &comp_delta_huf3,
-            _                       => block,
+            BLOCK_STORED             => block,
+            BLOCK_LZSS               => &comp_lzss,
+            BLOCK_LZSS_HUF           => &comp_lzss_huf,
+            BLOCK_LZSS_HUF3          => &comp_lzss_huf3,
+            BLOCK_DELTA1_LZSS        => &comp_delta,
+            BLOCK_DELTA2_LZSS        => &comp_delta,
+            BLOCK_DELTA3_LZSS        => &comp_delta,
+            BLOCK_DELTA4_LZSS        => &comp_delta,
+            BLOCK_DELTA1_LZSS_HUF    => &comp_delta_huf,
+            BLOCK_DELTA2_LZSS_HUF    => &comp_delta_huf,
+            BLOCK_DELTA3_LZSS_HUF    => &comp_delta_huf,
+            BLOCK_DELTA4_LZSS_HUF    => &comp_delta_huf,
+            BLOCK_DELTA1_LZSS_HUF3   => &comp_delta_huf3,
+            BLOCK_DELTA2_LZSS_HUF3   => &comp_delta_huf3,
+            BLOCK_DELTA3_LZSS_HUF3   => &comp_delta_huf3,
+            BLOCK_DELTA4_LZSS_HUF3   => &comp_delta_huf3,
+            BLOCK_DELTA1_O2_LZSS_HUF3  |
+            BLOCK_DELTA4_O2_LZSS_HUF3  |
+            BLOCK_LSIDE_D4_LZSS_HUF3   |
+            BLOCK_LSIDE_D4O2_LZSS_HUF3 => &comp_new_huf3,
+            _                          => block,
         };
 
         output.write_all(&[best_type])?;
@@ -827,6 +916,26 @@ pub fn decompress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) 
                 let lzss_bytes = lzss_huf3_decode(&data)?;
                 let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
                 delta_n_decode(decoded, 4)
+            }
+            BLOCK_DELTA1_O2_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_n_order2_decode(decoded, 1)
+            }
+            BLOCK_DELTA4_O2_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_n_order2_decode(decoded, 4)
+            }
+            BLOCK_LSIDE_D4_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                leftside_decode(delta_n_decode(decoded, 4))
+            }
+            BLOCK_LSIDE_D4O2_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                leftside_decode(delta_n_order2_decode(decoded, 4))
             }
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown block type")),
         };
