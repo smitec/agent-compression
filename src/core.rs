@@ -42,6 +42,9 @@ const BLOCK_DELTA_S16_O2_LZSS_HUF4:  u8 = 27;
 const BLOCK_LSIDE_S16_O2_LZSS_HUF4:  u8 = 28;
 const BLOCK_DELTA_S16_O3_LZSS_HUF4:  u8 = 29;
 const BLOCK_LSIDE_S16_O3_LZSS_HUF4:  u8 = 30;
+const BLOCK_PLANAR2_LZSS_HUF3:       u8 = 31;
+const BLOCK_PLANAR3_LZSS_HUF3:       u8 = 32;
+const BLOCK_PLANAR4_LZSS_HUF3:       u8 = 33;
 
 // ── BitWriter ────────────────────────────────────────────────────────────────
 
@@ -512,6 +515,40 @@ fn lside_s16_o3_decode(data: Vec<u8>) -> Vec<u8> {
         let r = r_prime.wrapping_add(l);
         for (j, b) in l.to_le_bytes().into_iter().enumerate() { out[i*4+j]   = b; }
         for (j, b) in r.to_le_bytes().into_iter().enumerate() { out[i*4+2+j] = b; }
+    }
+    out
+}
+
+fn planar_delta_encode(input: &[u8], stride: usize) -> Vec<u8> {
+    let num_samples = input.len() / stride;
+    let mut out = Vec::with_capacity(input.len());
+    for ch in 0..stride {
+        let mut prev = 0u8;
+        for i in 0..num_samples {
+            let cur = input[i * stride + ch];
+            out.push(cur.wrapping_sub(prev));
+            prev = cur;
+        }
+    }
+    out.extend_from_slice(&input[num_samples * stride..]);
+    out
+}
+
+fn planar_delta_decode(data: &[u8], stride: usize, orig_len: usize) -> Vec<u8> {
+    let num_samples = orig_len / stride;
+    let remainder = orig_len % stride;
+    let mut out = vec![0u8; orig_len];
+    for ch in 0..stride {
+        let mut prev = 0u8;
+        for i in 0..num_samples {
+            let cur = data[ch * num_samples + i].wrapping_add(prev);
+            out[i * stride + ch] = cur;
+            prev = cur;
+        }
+    }
+    let planar_end = stride * num_samples;
+    for i in 0..remainder {
+        out[num_samples * stride + i] = data[planar_end + i];
     }
     out
 }
@@ -1142,6 +1179,34 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
             }
         }
 
+        // Planar channel separation: deinterleave into planes, apply delta within each
+        // plane, then LZSS. Enables longer within-channel matches than interleaved delta.
+        // Gate on entropy difference (cheap) to avoid the expensive LZSS call on audio/text.
+        // Threshold 0.5 bits separates image data (strong stride correlation) from
+        // audio and text (weak stride-3/4 correlation).
+        let mut comp_planar_huf3: Vec<u8> = Vec::new();
+        {
+            let e_raw = estimate_entropy(block);
+            if e_raw < 7.0 {
+                for &(stride, flag) in &[
+                    (3usize, BLOCK_PLANAR3_LZSS_HUF3),
+                    (4usize, BLOCK_PLANAR4_LZSS_HUF3),
+                ] {
+                    let d = delta_n_encode(block, stride);
+                    if estimate_entropy(&d) < e_raw - 0.5 {
+                        let planar = planar_delta_encode(block, stride);
+                        let cd = lzss_compress(&[], &planar);
+                        let h3 = lzss_huf3_encode(&cd);
+                        if !h3.is_empty() && h3.len() < best_len {
+                            best_len = h3.len();
+                            best_type = flag;
+                            comp_planar_huf3 = h3;
+                        }
+                    }
+                }
+            }
+        }
+
         let data: &[u8] = match best_type {
             BLOCK_STORED             => block,
             BLOCK_LZSS               => &comp_lzss,
@@ -1174,6 +1239,8 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
             BLOCK_LSIDE_S16_O2_LZSS_HUF4 |
             BLOCK_DELTA_S16_O3_LZSS_HUF4 |
             BLOCK_LSIDE_S16_O3_LZSS_HUF4 => &comp_new_huf4,
+            BLOCK_PLANAR3_LZSS_HUF3 |
+            BLOCK_PLANAR4_LZSS_HUF3     => &comp_planar_huf3,
             _                          => block,
         };
 
@@ -1355,6 +1422,21 @@ pub fn decompress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) 
                 let lzss_bytes = lzss_huf4_decode(&data)?;
                 let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
                 lside_s16_o3_decode(decoded)
+            }
+            BLOCK_PLANAR2_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                planar_delta_decode(&decoded, 2, raw_len)
+            }
+            BLOCK_PLANAR3_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                planar_delta_decode(&decoded, 3, raw_len)
+            }
+            BLOCK_PLANAR4_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                planar_delta_decode(&decoded, 4, raw_len)
             }
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown block type")),
         };
