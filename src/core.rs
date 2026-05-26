@@ -33,6 +33,15 @@ const BLOCK_LSIDE_D4_LZSS_HUF3:   u8 = 18;
 const BLOCK_LSIDE_D4O2_LZSS_HUF3:    u8 = 19;
 const BLOCK_DELTA_S16_O2_LZSS_HUF3:  u8 = 20;
 const BLOCK_LSIDE_S16_O2_LZSS_HUF3:  u8 = 21;
+const BLOCK_DELTA_S16_O3_LZSS_HUF3:  u8 = 22;
+const BLOCK_LSIDE_S16_O3_LZSS_HUF3:  u8 = 23;
+const BLOCK_DELTA2_O2_LZSS_HUF3:     u8 = 24;
+const BLOCK_DELTA3_O2_LZSS_HUF3:     u8 = 25;
+const BLOCK_LZSS_HUF4:               u8 = 26;
+const BLOCK_DELTA_S16_O2_LZSS_HUF4:  u8 = 27;
+const BLOCK_LSIDE_S16_O2_LZSS_HUF4:  u8 = 28;
+const BLOCK_DELTA_S16_O3_LZSS_HUF4:  u8 = 29;
+const BLOCK_LSIDE_S16_O3_LZSS_HUF4:  u8 = 30;
 
 // ── BitWriter ────────────────────────────────────────────────────────────────
 
@@ -410,6 +419,103 @@ fn lside_s16_o2_decode(data: Vec<u8>) -> Vec<u8> {
     out
 }
 
+fn delta_s16_o3_encode(data: &[u8]) -> Vec<u8> {
+    let n = data.len();
+    if n % 2 != 0 || n < 6 { return data.to_vec(); }
+    let num_samples = n / 2;
+    let mut out = vec![0u8; n];
+    out[0] = data[0]; out[1] = data[1];
+    let s0 = i16::from_le_bytes([data[0], data[1]]);
+    let s1 = i16::from_le_bytes([data[2], data[3]]);
+    let d = s1.wrapping_sub(s0).to_le_bytes();
+    out[2] = d[0]; out[3] = d[1];
+    let s2 = i16::from_le_bytes([data[4], data[5]]);
+    let pred2 = (2i32 * s1 as i32 - s0 as i32) as i16;
+    let r2 = s2.wrapping_sub(pred2).to_le_bytes();
+    out[4] = r2[0]; out[5] = r2[1];
+    for i in 3..num_samples {
+        let sm3 = i16::from_le_bytes([data[(i-3)*2], data[(i-3)*2+1]]);
+        let sm2 = i16::from_le_bytes([data[(i-2)*2], data[(i-2)*2+1]]);
+        let sm1 = i16::from_le_bytes([data[(i-1)*2], data[(i-1)*2+1]]);
+        let s   = i16::from_le_bytes([data[i*2],     data[i*2+1]]);
+        let pred = (3i32 * sm1 as i32 - 3i32 * sm2 as i32 + sm3 as i32) as i16;
+        let res = s.wrapping_sub(pred).to_le_bytes();
+        out[i*2] = res[0]; out[i*2+1] = res[1];
+    }
+    out
+}
+
+fn delta_s16_o3_decode(mut data: Vec<u8>) -> Vec<u8> {
+    let n = data.len();
+    if n % 2 != 0 || n < 6 { return data; }
+    let num_samples = n / 2;
+    let s0 = i16::from_le_bytes([data[0], data[1]]);
+    let r1 = i16::from_le_bytes([data[2], data[3]]);
+    let s1 = r1.wrapping_add(s0).to_le_bytes();
+    data[2] = s1[0]; data[3] = s1[1];
+    let s0 = i16::from_le_bytes([data[0], data[1]]);
+    let s1 = i16::from_le_bytes([data[2], data[3]]);
+    let pred2 = (2i32 * s1 as i32 - s0 as i32) as i16;
+    let r2 = i16::from_le_bytes([data[4], data[5]]);
+    let s2 = r2.wrapping_add(pred2).to_le_bytes();
+    data[4] = s2[0]; data[5] = s2[1];
+    for i in 3..num_samples {
+        let sm3 = i16::from_le_bytes([data[(i-3)*2], data[(i-3)*2+1]]);
+        let sm2 = i16::from_le_bytes([data[(i-2)*2], data[(i-2)*2+1]]);
+        let sm1 = i16::from_le_bytes([data[(i-1)*2], data[(i-1)*2+1]]);
+        let pred = (3i32 * sm1 as i32 - 3i32 * sm2 as i32 + sm3 as i32) as i16;
+        let ri = i16::from_le_bytes([data[i*2], data[i*2+1]]);
+        let s = ri.wrapping_add(pred).to_le_bytes();
+        data[i*2] = s[0]; data[i*2+1] = s[1];
+    }
+    data
+}
+
+fn lside_s16_o3_encode(data: &[u8]) -> Vec<u8> {
+    let n = data.len();
+    if n % 4 != 0 || n < 12 { return data.to_vec(); }
+    let num_frames = n / 4;
+    let mut l_bytes: Vec<u8> = Vec::with_capacity(num_frames * 2);
+    let mut r_bytes: Vec<u8> = Vec::with_capacity(num_frames * 2);
+    for i in 0..num_frames {
+        let l = i16::from_le_bytes([data[i*4],   data[i*4+1]]);
+        let r = i16::from_le_bytes([data[i*4+2], data[i*4+3]]);
+        for b in l.to_le_bytes()                 { l_bytes.push(b); }
+        for b in r.wrapping_sub(l).to_le_bytes() { r_bytes.push(b); }
+    }
+    let l_enc = delta_s16_o3_encode(&l_bytes);
+    let r_enc = delta_s16_o3_encode(&r_bytes);
+    let mut out = vec![0u8; n];
+    for i in 0..num_frames {
+        out[i*4]   = l_enc[i*2];   out[i*4+1] = l_enc[i*2+1];
+        out[i*4+2] = r_enc[i*2];   out[i*4+3] = r_enc[i*2+1];
+    }
+    out
+}
+
+fn lside_s16_o3_decode(data: Vec<u8>) -> Vec<u8> {
+    let n = data.len();
+    if n % 4 != 0 || n < 12 { return data; }
+    let num_frames = n / 4;
+    let mut l_bytes: Vec<u8> = Vec::with_capacity(num_frames * 2);
+    let mut r_bytes: Vec<u8> = Vec::with_capacity(num_frames * 2);
+    for i in 0..num_frames {
+        l_bytes.push(data[i*4]);   l_bytes.push(data[i*4+1]);
+        r_bytes.push(data[i*4+2]); r_bytes.push(data[i*4+3]);
+    }
+    let l_dec = delta_s16_o3_decode(l_bytes);
+    let r_dec = delta_s16_o3_decode(r_bytes);
+    let mut out = vec![0u8; n];
+    for i in 0..num_frames {
+        let l       = i16::from_le_bytes([l_dec[i*2], l_dec[i*2+1]]);
+        let r_prime = i16::from_le_bytes([r_dec[i*2], r_dec[i*2+1]]);
+        let r = r_prime.wrapping_add(l);
+        for (j, b) in l.to_le_bytes().into_iter().enumerate() { out[i*4+j]   = b; }
+        for (j, b) in r.to_le_bytes().into_iter().enumerate() { out[i*4+2+j] = b; }
+    }
+    out
+}
+
 fn estimate_entropy(data: &[u8]) -> f32 {
     let mut freq = [0u32; 256];
     for &b in data { freq[b as usize] += 1; }
@@ -678,8 +784,10 @@ enum DeltaMode {
     None,
     Delta1, Delta2, Delta3, Delta4,
     Delta1O2, Delta4O2,
+    Delta2O2, Delta3O2,
     LsideD4, LsideD4O2,
     DeltaS16O2, LsideS16O2,
+    DeltaS16O3, LsideS16O3,
 }
 
 fn select_predictor(block: &[u8]) -> (DeltaMode, Vec<u8>) {
@@ -693,10 +801,21 @@ fn select_predictor(block: &[u8]) -> (DeltaMode, Vec<u8>) {
         (DeltaMode::Delta4,   delta_n_encode(block, 4)),
         (DeltaMode::Delta1O2, delta_n_order2_encode(block, 1)),
         (DeltaMode::Delta4O2, delta_n_order2_encode(block, 4)),
+        (DeltaMode::Delta2O2, delta_n_order2_encode(block, 2)),
+        (DeltaMode::Delta3O2, delta_n_order2_encode(block, 3)),
     ];
 
     if block.len() % 2 == 0 && block.len() >= 4 {
-        candidates.push((DeltaMode::DeltaS16O2, delta_s16_o2_encode(block)));
+        let s16o2_enc = delta_s16_o2_encode(block);
+        let s16o2_h = estimate_entropy(&s16o2_enc);
+        // Only try O3 if O2 shows clear sample-level improvement (rules out BMP false positives).
+        if block.len() >= 6 && s16o2_h < threshold - 0.10 {
+            let s16o3_enc = delta_s16_o3_encode(block);
+            if estimate_entropy(&s16o3_enc) < s16o2_h {
+                candidates.push((DeltaMode::DeltaS16O3, s16o3_enc));
+            }
+        }
+        candidates.push((DeltaMode::DeltaS16O2, s16o2_enc));
     }
 
     if block.len() % 4 == 0 {
@@ -704,7 +823,16 @@ fn select_predictor(block: &[u8]) -> (DeltaMode, Vec<u8>) {
         candidates.push((DeltaMode::LsideD4,   delta_n_encode(&ls, 4)));
         candidates.push((DeltaMode::LsideD4O2, delta_n_order2_encode(&ls, 4)));
         if block.len() >= 8 {
-            candidates.push((DeltaMode::LsideS16O2, lside_s16_o2_encode(block)));
+            let ls16o2_enc = lside_s16_o2_encode(block);
+            let ls16o2_h = estimate_entropy(&ls16o2_enc);
+            // Only try O3 if O2 shows clear sample-level improvement.
+            if block.len() >= 12 && ls16o2_h < threshold - 0.10 {
+                let ls16o3_enc = lside_s16_o3_encode(block);
+                if estimate_entropy(&ls16o3_enc) < ls16o2_h {
+                    candidates.push((DeltaMode::LsideS16O3, ls16o3_enc));
+                }
+            }
+            candidates.push((DeltaMode::LsideS16O2, ls16o2_enc));
         }
     }
 
@@ -812,6 +940,101 @@ fn lzss_huf3_decode(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+// ── 4-Stream Huffman ─────────────────────────────────────────────────────────
+
+// Like lzss_huf3 but splits offset bytes into separate lo/hi streams.
+// Wire format: [4B cmds_len][4B lits_len][4B lo_len][cmds_huf][lits_huf][lo_huf][hi_huf]
+fn lzss_huf4_encode(lzss_data: &[u8]) -> Vec<u8> {
+    if lzss_data.is_empty() { return Vec::new(); }
+
+    let mut cmds = Vec::new();
+    let mut lits = Vec::new();
+    let mut offs_lo = Vec::new();
+    let mut offs_hi = Vec::new();
+
+    let mut pos = 0;
+    while pos < lzss_data.len() {
+        let cmd = lzss_data[pos];
+        pos += 1;
+        cmds.push(cmd);
+        if cmd <= 0x80 {
+            let count = cmd as usize;
+            lits.extend_from_slice(&lzss_data[pos..pos + count]);
+            pos += count;
+        } else {
+            offs_lo.push(lzss_data[pos]);
+            offs_hi.push(lzss_data[pos + 1]);
+            pos += 2;
+        }
+    }
+
+    let cmds_huf = huffman_encode(&cmds);
+    let lits_huf = if lits.is_empty()    { Vec::new() } else { huffman_encode(&lits) };
+    let lo_huf   = if offs_lo.is_empty() { Vec::new() } else { huffman_encode(&offs_lo) };
+    let hi_huf   = if offs_hi.is_empty() { Vec::new() } else { huffman_encode(&offs_hi) };
+
+    let mut out = Vec::with_capacity(12 + cmds_huf.len() + lits_huf.len() + lo_huf.len() + hi_huf.len());
+    out.extend_from_slice(&(cmds_huf.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(lits_huf.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(lo_huf.len()   as u32).to_le_bytes());
+    out.extend(cmds_huf);
+    out.extend(lits_huf);
+    out.extend(lo_huf);
+    out.extend(hi_huf);
+    out
+}
+
+fn lzss_huf4_decode(data: &[u8]) -> io::Result<Vec<u8>> {
+    if data.is_empty() { return Ok(Vec::new()); }
+    if data.len() < 12 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "huf4 block too short"));
+    }
+
+    let cmds_huf_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let lits_huf_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let lo_huf_len   = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+
+    if 12 + cmds_huf_len + lits_huf_len + lo_huf_len > data.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "huf4 section lengths overflow"));
+    }
+
+    let cmds_section = &data[12..12 + cmds_huf_len];
+    let lits_section = &data[12 + cmds_huf_len..12 + cmds_huf_len + lits_huf_len];
+    let lo_section   = &data[12 + cmds_huf_len + lits_huf_len..
+                              12 + cmds_huf_len + lits_huf_len + lo_huf_len];
+    let hi_section   = &data[12 + cmds_huf_len + lits_huf_len + lo_huf_len..];
+
+    let cmds    = huffman_decode(cmds_section)?;
+    let lits    = if lits_huf_len == 0       { Vec::new() } else { huffman_decode(lits_section)? };
+    let offs_lo = if lo_huf_len == 0         { Vec::new() } else { huffman_decode(lo_section)? };
+    let offs_hi = if hi_section.is_empty()   { Vec::new() } else { huffman_decode(hi_section)? };
+
+    let mut out = Vec::new();
+    let mut lits_pos = 0usize;
+    let mut offs_pos = 0usize;
+
+    for &cmd in &cmds {
+        out.push(cmd);
+        if cmd <= 0x80 {
+            let count = cmd as usize;
+            if lits_pos + count > lits.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "huf4 lits truncated"));
+            }
+            out.extend_from_slice(&lits[lits_pos..lits_pos + count]);
+            lits_pos += count;
+        } else {
+            if offs_pos >= offs_lo.len() || offs_pos >= offs_hi.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "huf4 offs truncated"));
+            }
+            out.push(offs_lo[offs_pos]);
+            out.push(offs_hi[offs_pos]);
+            offs_pos += 1;
+        }
+    }
+
+    Ok(out)
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) -> io::Result<()> {
@@ -829,10 +1052,11 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
         if n == 0 { break; }
         let block = &in_buf[..n];
 
-        // Candidate A: LZSS with cross-block history (± single-tree Huffman ± 3-stream Huffman).
+        // Candidate A: LZSS with cross-block history (± single-tree Huffman ± 3/4-stream Huffman).
         let comp_lzss = lzss_compress(&history, block);
         let comp_lzss_huf = huffman_encode(&comp_lzss);
         let comp_lzss_huf3 = lzss_huf3_encode(&comp_lzss);
+        let comp_lzss_huf4 = lzss_huf4_encode(&comp_lzss);
 
         // Candidate B: best predictor + LZSS (self-contained, ± Huffman variants).
         let (delta_mode, delta_buf) = select_predictor(block);
@@ -861,6 +1085,7 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
         consider!(comp_lzss.len(), BLOCK_LZSS);
         if !comp_lzss_huf.is_empty()  { consider!(comp_lzss_huf.len(),  BLOCK_LZSS_HUF); }
         if !comp_lzss_huf3.is_empty() { consider!(comp_lzss_huf3.len(), BLOCK_LZSS_HUF3); }
+        if !comp_lzss_huf4.is_empty() { consider!(comp_lzss_huf4.len(), BLOCK_LZSS_HUF4); }
         if !comp_delta.is_empty() {
             let (df, dhf, dhf3) = match delta_mode {
                 DeltaMode::Delta1 => (BLOCK_DELTA1_LZSS, BLOCK_DELTA1_LZSS_HUF, BLOCK_DELTA1_LZSS_HUF3),
@@ -874,11 +1099,14 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
             if !comp_delta_huf3.is_empty() { consider!(comp_delta_huf3.len(), dhf3); }
         }
 
-        // Candidate C: new-predictor modes (HUF3 only, no cross-block history).
+        // Candidate C: new-predictor modes (HUF3 ± HUF4, no cross-block history).
         let mut comp_new_huf3: Vec<u8> = Vec::new();
+        let mut comp_new_huf4: Vec<u8> = Vec::new();
         if matches!(delta_mode, DeltaMode::Delta1O2   | DeltaMode::Delta4O2 |
+                                DeltaMode::Delta2O2   | DeltaMode::Delta3O2 |
                                 DeltaMode::LsideD4    | DeltaMode::LsideD4O2 |
-                                DeltaMode::DeltaS16O2 | DeltaMode::LsideS16O2)
+                                DeltaMode::DeltaS16O2 | DeltaMode::LsideS16O2 |
+                                DeltaMode::DeltaS16O3 | DeltaMode::LsideS16O3)
         {
             let cd = lzss_compress(&[], &delta_buf);
             comp_new_huf3 = lzss_huf3_encode(&cd);
@@ -886,13 +1114,31 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
                 let flag = match delta_mode {
                     DeltaMode::Delta1O2   => BLOCK_DELTA1_O2_LZSS_HUF3,
                     DeltaMode::Delta4O2   => BLOCK_DELTA4_O2_LZSS_HUF3,
+                    DeltaMode::Delta2O2   => BLOCK_DELTA2_O2_LZSS_HUF3,
+                    DeltaMode::Delta3O2   => BLOCK_DELTA3_O2_LZSS_HUF3,
                     DeltaMode::LsideD4    => BLOCK_LSIDE_D4_LZSS_HUF3,
                     DeltaMode::LsideD4O2  => BLOCK_LSIDE_D4O2_LZSS_HUF3,
                     DeltaMode::DeltaS16O2 => BLOCK_DELTA_S16_O2_LZSS_HUF3,
                     DeltaMode::LsideS16O2 => BLOCK_LSIDE_S16_O2_LZSS_HUF3,
+                    DeltaMode::DeltaS16O3 => BLOCK_DELTA_S16_O3_LZSS_HUF3,
+                    DeltaMode::LsideS16O3 => BLOCK_LSIDE_S16_O3_LZSS_HUF3,
                     _                     => unreachable!(),
                 };
                 consider!(comp_new_huf3.len(), flag);
+            }
+            // HUF4 variants only for the 16-bit sample predictors.
+            let flag4_opt = match delta_mode {
+                DeltaMode::DeltaS16O2 => Some(BLOCK_DELTA_S16_O2_LZSS_HUF4),
+                DeltaMode::LsideS16O2 => Some(BLOCK_LSIDE_S16_O2_LZSS_HUF4),
+                DeltaMode::DeltaS16O3 => Some(BLOCK_DELTA_S16_O3_LZSS_HUF4),
+                DeltaMode::LsideS16O3 => Some(BLOCK_LSIDE_S16_O3_LZSS_HUF4),
+                _                     => None,
+            };
+            if let Some(flag4) = flag4_opt {
+                comp_new_huf4 = lzss_huf4_encode(&cd);
+                if !comp_new_huf4.is_empty() {
+                    consider!(comp_new_huf4.len(), flag4);
+                }
             }
         }
 
@@ -901,6 +1147,7 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
             BLOCK_LZSS               => &comp_lzss,
             BLOCK_LZSS_HUF           => &comp_lzss_huf,
             BLOCK_LZSS_HUF3          => &comp_lzss_huf3,
+            BLOCK_LZSS_HUF4          => &comp_lzss_huf4,
             BLOCK_DELTA1_LZSS        => &comp_delta,
             BLOCK_DELTA2_LZSS        => &comp_delta,
             BLOCK_DELTA3_LZSS        => &comp_delta,
@@ -915,10 +1162,18 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
             BLOCK_DELTA4_LZSS_HUF3   => &comp_delta_huf3,
             BLOCK_DELTA1_O2_LZSS_HUF3   |
             BLOCK_DELTA4_O2_LZSS_HUF3   |
+            BLOCK_DELTA2_O2_LZSS_HUF3   |
+            BLOCK_DELTA3_O2_LZSS_HUF3   |
             BLOCK_LSIDE_D4_LZSS_HUF3    |
             BLOCK_LSIDE_D4O2_LZSS_HUF3  |
             BLOCK_DELTA_S16_O2_LZSS_HUF3 |
-            BLOCK_LSIDE_S16_O2_LZSS_HUF3 => &comp_new_huf3,
+            BLOCK_LSIDE_S16_O2_LZSS_HUF3 |
+            BLOCK_DELTA_S16_O3_LZSS_HUF3 |
+            BLOCK_LSIDE_S16_O3_LZSS_HUF3 => &comp_new_huf3,
+            BLOCK_DELTA_S16_O2_LZSS_HUF4 |
+            BLOCK_LSIDE_S16_O2_LZSS_HUF4 |
+            BLOCK_DELTA_S16_O3_LZSS_HUF4 |
+            BLOCK_LSIDE_S16_O3_LZSS_HUF4 => &comp_new_huf4,
             _                          => block,
         };
 
@@ -1056,6 +1311,50 @@ pub fn decompress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) 
                 let lzss_bytes = lzss_huf3_decode(&data)?;
                 let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
                 lside_s16_o2_decode(decoded)
+            }
+            BLOCK_DELTA_S16_O3_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_s16_o3_decode(decoded)
+            }
+            BLOCK_LSIDE_S16_O3_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                lside_s16_o3_decode(decoded)
+            }
+            BLOCK_DELTA2_O2_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_n_order2_decode(decoded, 2)
+            }
+            BLOCK_DELTA3_O2_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_n_order2_decode(decoded, 3)
+            }
+            BLOCK_LZSS_HUF4 => {
+                let lzss_bytes = lzss_huf4_decode(&data)?;
+                lzss_decompress(&history, &lzss_bytes, raw_len)?
+            }
+            BLOCK_DELTA_S16_O2_LZSS_HUF4 => {
+                let lzss_bytes = lzss_huf4_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_s16_o2_decode(decoded)
+            }
+            BLOCK_LSIDE_S16_O2_LZSS_HUF4 => {
+                let lzss_bytes = lzss_huf4_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                lside_s16_o2_decode(decoded)
+            }
+            BLOCK_DELTA_S16_O3_LZSS_HUF4 => {
+                let lzss_bytes = lzss_huf4_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                delta_s16_o3_decode(decoded)
+            }
+            BLOCK_LSIDE_S16_O3_LZSS_HUF4 => {
+                let lzss_bytes = lzss_huf4_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                lside_s16_o3_decode(decoded)
             }
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown block type")),
         };
