@@ -9,7 +9,7 @@ const HASH_BITS: usize = 16;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const MAX_MATCH: usize = 130;
 const MIN_MATCH: usize = 4;
-const MAX_CHAIN: usize = 32;
+const MAX_CHAIN: usize = 64;
 
 const BLOCK_STORED: u8 = 0;
 const BLOCK_LZSS: u8 = 1;
@@ -45,6 +45,11 @@ const BLOCK_LSIDE_S16_O3_LZSS_HUF4:  u8 = 30;
 const BLOCK_PLANAR2_LZSS_HUF3:       u8 = 31;
 const BLOCK_PLANAR3_LZSS_HUF3:       u8 = 32;
 const BLOCK_PLANAR4_LZSS_HUF3:       u8 = 33;
+const BLOCK_PLANAR2_O2_LZSS_HUF3:    u8 = 34;
+const BLOCK_PLANAR3_O2_LZSS_HUF3:    u8 = 35;
+const BLOCK_PLANAR4_O2_LZSS_HUF3:    u8 = 36;
+const BLOCK_PLANAR4_S16_O2_LZSS_HUF4: u8 = 37;
+const BLOCK_PLANAR4_S16_O3_LZSS_HUF4: u8 = 38;
 
 // ── BitWriter ────────────────────────────────────────────────────────────────
 
@@ -553,6 +558,88 @@ fn planar_delta_decode(data: &[u8], stride: usize, orig_len: usize) -> Vec<u8> {
     out
 }
 
+fn planar_o2_delta_encode(input: &[u8], stride: usize) -> Vec<u8> {
+    let num_samples = input.len() / stride;
+    let mut out = Vec::with_capacity(input.len());
+    for ch in 0..stride {
+        let plane: Vec<u8> = (0..num_samples).map(|i| input[i * stride + ch]).collect();
+        out.extend(delta_n_order2_encode(&plane, 1));
+    }
+    out.extend_from_slice(&input[num_samples * stride..]);
+    out
+}
+
+fn planar_o2_delta_decode(data: &[u8], stride: usize, orig_len: usize) -> Vec<u8> {
+    let num_samples = orig_len / stride;
+    let remainder = orig_len % stride;
+    let mut out = vec![0u8; orig_len];
+    for ch in 0..stride {
+        let plane_start = ch * num_samples;
+        let plane = data[plane_start..plane_start + num_samples].to_vec();
+        let decoded = delta_n_order2_decode(plane, 1);
+        for i in 0..num_samples { out[i * stride + ch] = decoded[i]; }
+    }
+    let planar_end = stride * num_samples;
+    for i in 0..remainder { out[num_samples * stride + i] = data[planar_end + i]; }
+    out
+}
+
+fn stereo_planar_s16_o2_encode(input: &[u8]) -> Vec<u8> {
+    let n = input.len();
+    if n % 4 != 0 || n < 8 { return input.to_vec(); }
+    let num_frames = n / 4;
+    let mut l = Vec::with_capacity(num_frames * 2);
+    let mut r = Vec::with_capacity(num_frames * 2);
+    for i in 0..num_frames {
+        l.push(input[i * 4]);     l.push(input[i * 4 + 1]);
+        r.push(input[i * 4 + 2]); r.push(input[i * 4 + 3]);
+    }
+    let mut out = delta_s16_o2_encode(&l);
+    out.extend(delta_s16_o2_encode(&r));
+    out
+}
+
+fn stereo_planar_s16_o2_decode(data: &[u8], orig_len: usize) -> Vec<u8> {
+    let num_frames = orig_len / 4;
+    let half = num_frames * 2;
+    let l = delta_s16_o2_decode(data[..half].to_vec());
+    let r = delta_s16_o2_decode(data[half..half * 2].to_vec());
+    let mut out = vec![0u8; orig_len];
+    for i in 0..num_frames {
+        out[i * 4]     = l[i * 2]; out[i * 4 + 1] = l[i * 2 + 1];
+        out[i * 4 + 2] = r[i * 2]; out[i * 4 + 3] = r[i * 2 + 1];
+    }
+    out
+}
+
+fn stereo_planar_s16_o3_encode(input: &[u8]) -> Vec<u8> {
+    let n = input.len();
+    if n % 4 != 0 || n < 12 { return input.to_vec(); }
+    let num_frames = n / 4;
+    let mut l = Vec::with_capacity(num_frames * 2);
+    let mut r = Vec::with_capacity(num_frames * 2);
+    for i in 0..num_frames {
+        l.push(input[i * 4]);     l.push(input[i * 4 + 1]);
+        r.push(input[i * 4 + 2]); r.push(input[i * 4 + 3]);
+    }
+    let mut out = delta_s16_o3_encode(&l);
+    out.extend(delta_s16_o3_encode(&r));
+    out
+}
+
+fn stereo_planar_s16_o3_decode(data: &[u8], orig_len: usize) -> Vec<u8> {
+    let num_frames = orig_len / 4;
+    let half = num_frames * 2;
+    let l = delta_s16_o3_decode(data[..half].to_vec());
+    let r = delta_s16_o3_decode(data[half..half * 2].to_vec());
+    let mut out = vec![0u8; orig_len];
+    for i in 0..num_frames {
+        out[i * 4]     = l[i * 2]; out[i * 4 + 1] = l[i * 2 + 1];
+        out[i * 4 + 2] = r[i * 2]; out[i * 4 + 3] = r[i * 2 + 1];
+    }
+    out
+}
+
 fn estimate_entropy(data: &[u8]) -> f32 {
     let mut freq = [0u32; 256];
     for &b in data { freq[b as usize] += 1; }
@@ -689,8 +776,17 @@ fn lzss_compress(prefix: &[u8], input: &[u8]) -> Vec<u8> {
                             use_off = lo2;
                             use_len = ll2;
                             skip = 2;
+                            // pos+3: one more level of lazy matching.
+                            if ll2 < MAX_MATCH && pos + 3 + MIN_MATCH <= combined_len {
+                                let (lo3, ll3) = find_best_match_at(&combined, pos + 3, combined_len, &mut head, &mut chain);
+                                if ll3 > ll2 {
+                                    use_off = lo3;
+                                    use_len = ll3;
+                                    skip = 3;
+                                }
+                            }
                         }
-                        // pos+2 now inserted in the hash table regardless.
+                        // pos+2 (and pos+3 if probed) now inserted in the hash table regardless.
                     }
 
                     if lit_len == 0 { lit_start = pos; }
@@ -1185,13 +1281,18 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
         // Threshold 0.5 bits separates image data (strong stride correlation) from
         // audio and text (weak stride-3/4 correlation).
         let mut comp_planar_huf3: Vec<u8> = Vec::new();
+        let mut comp_planar_o2_huf3: Vec<u8> = Vec::new();
+        let mut comp_stereo_planar_huf4: Vec<u8> = Vec::new();
         {
             let e_raw = estimate_entropy(block);
             if e_raw < 7.0 {
+                // Planar delta-1 (strides 2, 3, 4).
                 for &(stride, flag) in &[
+                    (2usize, BLOCK_PLANAR2_LZSS_HUF3),
                     (3usize, BLOCK_PLANAR3_LZSS_HUF3),
                     (4usize, BLOCK_PLANAR4_LZSS_HUF3),
                 ] {
+                    if block.len() % stride != 0 { continue; }
                     let d = delta_n_encode(block, stride);
                     if estimate_entropy(&d) < e_raw - 0.5 {
                         let planar = planar_delta_encode(block, stride);
@@ -1201,6 +1302,53 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
                             best_len = h3.len();
                             best_type = flag;
                             comp_planar_huf3 = h3;
+                        }
+                    }
+                }
+
+                // Planar delta-O2 within each plane (strides 2, 3, 4).
+                for &(stride, flag) in &[
+                    (2usize, BLOCK_PLANAR2_O2_LZSS_HUF3),
+                    (3usize, BLOCK_PLANAR3_O2_LZSS_HUF3),
+                    (4usize, BLOCK_PLANAR4_O2_LZSS_HUF3),
+                ] {
+                    if block.len() % stride != 0 { continue; }
+                    let d = delta_n_encode(block, stride);
+                    if estimate_entropy(&d) < e_raw - 0.5 {
+                        let planar = planar_o2_delta_encode(block, stride);
+                        let cd = lzss_compress(&[], &planar);
+                        let h3 = lzss_huf3_encode(&cd);
+                        if !h3.is_empty() && h3.len() < best_len {
+                            best_len = h3.len();
+                            best_type = flag;
+                            comp_planar_o2_huf3 = h3;
+                        }
+                    }
+                }
+
+                // Stereo planar + S16 O2/O3: deinterleave into L/R 16-bit streams, apply
+                // sample-level prediction within each channel, concatenate (non-interleaved).
+                if block.len() % 4 == 0 && block.len() >= 8 {
+                    let sp_o2 = stereo_planar_s16_o2_encode(block);
+                    let e_sp = estimate_entropy(&sp_o2);
+                    if e_sp < e_raw - 0.3 {
+                        let cd = lzss_compress(&[], &sp_o2);
+                        let h4 = lzss_huf4_encode(&cd);
+                        if !h4.is_empty() && h4.len() < best_len {
+                            best_len = h4.len();
+                            best_type = BLOCK_PLANAR4_S16_O2_LZSS_HUF4;
+                            comp_stereo_planar_huf4 = h4;
+                        }
+                        if block.len() >= 12 {
+                            let sp_o3 = stereo_planar_s16_o3_encode(block);
+                            if estimate_entropy(&sp_o3) < e_sp {
+                                let cd3 = lzss_compress(&[], &sp_o3);
+                                let h4_3 = lzss_huf4_encode(&cd3);
+                                if !h4_3.is_empty() && h4_3.len() < best_len {
+                                    best_type = BLOCK_PLANAR4_S16_O3_LZSS_HUF4;
+                                    comp_stereo_planar_huf4 = h4_3;
+                                }
+                            }
                         }
                     }
                 }
@@ -1239,8 +1387,14 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
             BLOCK_LSIDE_S16_O2_LZSS_HUF4 |
             BLOCK_DELTA_S16_O3_LZSS_HUF4 |
             BLOCK_LSIDE_S16_O3_LZSS_HUF4 => &comp_new_huf4,
+            BLOCK_PLANAR2_LZSS_HUF3 |
             BLOCK_PLANAR3_LZSS_HUF3 |
             BLOCK_PLANAR4_LZSS_HUF3     => &comp_planar_huf3,
+            BLOCK_PLANAR2_O2_LZSS_HUF3 |
+            BLOCK_PLANAR3_O2_LZSS_HUF3 |
+            BLOCK_PLANAR4_O2_LZSS_HUF3  => &comp_planar_o2_huf3,
+            BLOCK_PLANAR4_S16_O2_LZSS_HUF4 |
+            BLOCK_PLANAR4_S16_O3_LZSS_HUF4 => &comp_stereo_planar_huf4,
             _                          => block,
         };
 
@@ -1437,6 +1591,31 @@ pub fn decompress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) 
                 let lzss_bytes = lzss_huf3_decode(&data)?;
                 let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
                 planar_delta_decode(&decoded, 4, raw_len)
+            }
+            BLOCK_PLANAR2_O2_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                planar_o2_delta_decode(&decoded, 2, raw_len)
+            }
+            BLOCK_PLANAR3_O2_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                planar_o2_delta_decode(&decoded, 3, raw_len)
+            }
+            BLOCK_PLANAR4_O2_LZSS_HUF3 => {
+                let lzss_bytes = lzss_huf3_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                planar_o2_delta_decode(&decoded, 4, raw_len)
+            }
+            BLOCK_PLANAR4_S16_O2_LZSS_HUF4 => {
+                let lzss_bytes = lzss_huf4_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                stereo_planar_s16_o2_decode(&decoded, raw_len)
+            }
+            BLOCK_PLANAR4_S16_O3_LZSS_HUF4 => {
+                let lzss_bytes = lzss_huf4_decode(&data)?;
+                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                stereo_planar_s16_o3_decode(&decoded, raw_len)
             }
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown block type")),
         };
