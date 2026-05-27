@@ -50,6 +50,8 @@ const BLOCK_PLANAR3_O2_LZSS_HUF3:    u8 = 35;
 const BLOCK_PLANAR4_O2_LZSS_HUF3:    u8 = 36;
 const BLOCK_PLANAR4_S16_O2_LZSS_HUF4: u8 = 37;
 const BLOCK_PLANAR4_S16_O3_LZSS_HUF4: u8 = 38;
+const BLOCK_PLANAR3_LZSS_HUF4:         u8 = 39;
+const BLOCK_PLANAR3_O2_LZSS_HUF4:      u8 = 40;
 
 // ── BitWriter ────────────────────────────────────────────────────────────────
 
@@ -1179,6 +1181,9 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
 
     let mut in_buf = vec![0u8; BLOCK_SIZE];
     let mut history: Vec<u8> = Vec::new();
+    let mut sp_history: Vec<u8> = Vec::new();
+    let mut p3_history: Vec<u8> = Vec::new();
+    let mut last_p3_is_o2: bool = false;
 
     loop {
         let n = read_full(&mut input, &mut in_buf)?;
@@ -1278,75 +1283,111 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
         // Planar channel separation: deinterleave into planes, apply delta within each
         // plane, then LZSS. Enables longer within-channel matches than interleaved delta.
         // Gate on entropy difference (cheap) to avoid the expensive LZSS call on audio/text.
-        // Threshold 0.5 bits separates image data (strong stride correlation) from
-        // audio and text (weak stride-3/4 correlation).
+        // For stride-3 (24-bit images) and stereo S16 (audio), also pass the previous
+        // block's transform-domain data as LZSS prefix to enable cross-block matching.
         let mut comp_planar_huf3: Vec<u8> = Vec::new();
         let mut comp_planar_o2_huf3: Vec<u8> = Vec::new();
         let mut comp_stereo_planar_huf4: Vec<u8> = Vec::new();
+        let mut sp_transform_used: Vec<u8> = Vec::new();
+        let mut p3_transform_candidate: Vec<u8> = Vec::new();
+        let mut p3_o2_transform_candidate: Vec<u8> = Vec::new();
         {
             let e_raw = estimate_entropy(block);
             if e_raw < 7.0 {
                 // Planar delta-1 (strides 2, 3, 4).
+                // planar_delta_encode handles non-multiple block sizes (remainder appended verbatim),
+                // so we only skip when block is shorter than 2 samples for the given stride.
+                // For stride-3 (24-bit RGB): also try HUF4 (offset lo/hi split), since match offsets
+                // cluster at channel-width distances (~0x5554) giving a skewed hi-byte distribution.
+                // Cross-block history applies when the previous stride-3 block used the same transform.
                 for &(stride, flag) in &[
                     (2usize, BLOCK_PLANAR2_LZSS_HUF3),
                     (3usize, BLOCK_PLANAR3_LZSS_HUF3),
                     (4usize, BLOCK_PLANAR4_LZSS_HUF3),
                 ] {
-                    if block.len() % stride != 0 { continue; }
+                    if block.len() < stride * 2 { continue; }
                     let d = delta_n_encode(block, stride);
                     if estimate_entropy(&d) < e_raw - 0.5 {
                         let planar = planar_delta_encode(block, stride);
-                        let cd = lzss_compress(&[], &planar);
+                        let cd = {
+                            let prefix: &[u8] = if stride == 3 && !last_p3_is_o2 { &p3_history } else { &[] };
+                            lzss_compress(prefix, &planar)
+                        };
                         let h3 = lzss_huf3_encode(&cd);
                         if !h3.is_empty() && h3.len() < best_len {
                             best_len = h3.len();
                             best_type = flag;
                             comp_planar_huf3 = h3;
                         }
+                        if stride == 3 {
+                            let h4 = lzss_huf4_encode(&cd);
+                            if !h4.is_empty() && h4.len() < best_len {
+                                best_len = h4.len();
+                                best_type = BLOCK_PLANAR3_LZSS_HUF4;
+                                comp_planar_huf3 = h4;
+                            }
+                            p3_transform_candidate = planar;
+                        }
                     }
                 }
 
                 // Planar delta-O2 within each plane (strides 2, 3, 4).
+                // Same HUF4 and cross-block history logic as delta-1 for stride-3.
                 for &(stride, flag) in &[
                     (2usize, BLOCK_PLANAR2_O2_LZSS_HUF3),
                     (3usize, BLOCK_PLANAR3_O2_LZSS_HUF3),
                     (4usize, BLOCK_PLANAR4_O2_LZSS_HUF3),
                 ] {
-                    if block.len() % stride != 0 { continue; }
+                    if block.len() < stride * 2 { continue; }
                     let d = delta_n_encode(block, stride);
                     if estimate_entropy(&d) < e_raw - 0.5 {
                         let planar = planar_o2_delta_encode(block, stride);
-                        let cd = lzss_compress(&[], &planar);
+                        let cd = {
+                            let prefix: &[u8] = if stride == 3 && last_p3_is_o2 { &p3_history } else { &[] };
+                            lzss_compress(prefix, &planar)
+                        };
                         let h3 = lzss_huf3_encode(&cd);
                         if !h3.is_empty() && h3.len() < best_len {
                             best_len = h3.len();
                             best_type = flag;
                             comp_planar_o2_huf3 = h3;
                         }
+                        if stride == 3 {
+                            let h4 = lzss_huf4_encode(&cd);
+                            if !h4.is_empty() && h4.len() < best_len {
+                                best_len = h4.len();
+                                best_type = BLOCK_PLANAR3_O2_LZSS_HUF4;
+                                comp_planar_o2_huf3 = h4;
+                            }
+                            p3_o2_transform_candidate = planar;
+                        }
                     }
                 }
 
                 // Stereo planar + S16 O2/O3: deinterleave into L/R 16-bit streams, apply
                 // sample-level prediction within each channel, concatenate (non-interleaved).
+                // Pass previous block's transform output as LZSS prefix (cross-block history).
                 if block.len() % 4 == 0 && block.len() >= 8 {
                     let sp_o2 = stereo_planar_s16_o2_encode(block);
                     let e_sp = estimate_entropy(&sp_o2);
-                    if e_sp < e_raw - 0.3 {
-                        let cd = lzss_compress(&[], &sp_o2);
-                        let h4 = lzss_huf4_encode(&cd);
+                    if e_sp < e_raw - 0.1 {
+                        let cd_o2 = lzss_compress(&sp_history, &sp_o2);
+                        let h4 = lzss_huf4_encode(&cd_o2);
                         if !h4.is_empty() && h4.len() < best_len {
                             best_len = h4.len();
                             best_type = BLOCK_PLANAR4_S16_O2_LZSS_HUF4;
                             comp_stereo_planar_huf4 = h4;
+                            sp_transform_used = sp_o2.clone();
                         }
                         if block.len() >= 12 {
                             let sp_o3 = stereo_planar_s16_o3_encode(block);
                             if estimate_entropy(&sp_o3) < e_sp {
-                                let cd3 = lzss_compress(&[], &sp_o3);
+                                let cd3 = lzss_compress(&sp_history, &sp_o3);
                                 let h4_3 = lzss_huf4_encode(&cd3);
                                 if !h4_3.is_empty() && h4_3.len() < best_len {
                                     best_type = BLOCK_PLANAR4_S16_O3_LZSS_HUF4;
                                     comp_stereo_planar_huf4 = h4_3;
+                                    sp_transform_used = sp_o3;
                                 }
                             }
                         }
@@ -1389,9 +1430,11 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
             BLOCK_LSIDE_S16_O3_LZSS_HUF4 => &comp_new_huf4,
             BLOCK_PLANAR2_LZSS_HUF3 |
             BLOCK_PLANAR3_LZSS_HUF3 |
+            BLOCK_PLANAR3_LZSS_HUF4 |
             BLOCK_PLANAR4_LZSS_HUF3     => &comp_planar_huf3,
             BLOCK_PLANAR2_O2_LZSS_HUF3 |
             BLOCK_PLANAR3_O2_LZSS_HUF3 |
+            BLOCK_PLANAR3_O2_LZSS_HUF4 |
             BLOCK_PLANAR4_O2_LZSS_HUF3  => &comp_planar_o2_huf3,
             BLOCK_PLANAR4_S16_O2_LZSS_HUF4 |
             BLOCK_PLANAR4_S16_O3_LZSS_HUF4 => &comp_stereo_planar_huf4,
@@ -1403,6 +1446,20 @@ pub fn compress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) ->
         output.write_all(&(data.len() as u32).to_le_bytes())?;
         output.write_all(data)?;
 
+        match best_type {
+            BLOCK_PLANAR4_S16_O2_LZSS_HUF4 | BLOCK_PLANAR4_S16_O3_LZSS_HUF4 => {
+                push_history(&mut sp_history, &sp_transform_used);
+            }
+            BLOCK_PLANAR3_LZSS_HUF3 | BLOCK_PLANAR3_LZSS_HUF4 => {
+                push_history(&mut p3_history, &p3_transform_candidate);
+                last_p3_is_o2 = false;
+            }
+            BLOCK_PLANAR3_O2_LZSS_HUF3 | BLOCK_PLANAR3_O2_LZSS_HUF4 => {
+                push_history(&mut p3_history, &p3_o2_transform_candidate);
+                last_p3_is_o2 = true;
+            }
+            _ => {}
+        }
         push_history(&mut history, block);
     }
 
@@ -1421,6 +1478,9 @@ pub fn decompress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) 
     let mut flag_buf = [0u8; 1];
     let mut len_buf = [0u8; 4];
     let mut history: Vec<u8> = Vec::new();
+    let mut sp_history: Vec<u8> = Vec::new();
+    let mut p3_history: Vec<u8> = Vec::new();
+    let mut last_p3_is_o2: bool = false;
 
     loop {
         match input.read_exact(&mut flag_buf) {
@@ -1584,7 +1644,12 @@ pub fn decompress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) 
             }
             BLOCK_PLANAR3_LZSS_HUF3 => {
                 let lzss_bytes = lzss_huf3_decode(&data)?;
-                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                let decoded = {
+                    let prefix: &[u8] = if !last_p3_is_o2 { &p3_history } else { &[] };
+                    lzss_decompress(prefix, &lzss_bytes, raw_len)?
+                };
+                push_history(&mut p3_history, &decoded);
+                last_p3_is_o2 = false;
                 planar_delta_decode(&decoded, 3, raw_len)
             }
             BLOCK_PLANAR4_LZSS_HUF3 => {
@@ -1599,7 +1664,32 @@ pub fn decompress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) 
             }
             BLOCK_PLANAR3_O2_LZSS_HUF3 => {
                 let lzss_bytes = lzss_huf3_decode(&data)?;
-                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                let decoded = {
+                    let prefix: &[u8] = if last_p3_is_o2 { &p3_history } else { &[] };
+                    lzss_decompress(prefix, &lzss_bytes, raw_len)?
+                };
+                push_history(&mut p3_history, &decoded);
+                last_p3_is_o2 = true;
+                planar_o2_delta_decode(&decoded, 3, raw_len)
+            }
+            BLOCK_PLANAR3_LZSS_HUF4 => {
+                let lzss_bytes = lzss_huf4_decode(&data)?;
+                let decoded = {
+                    let prefix: &[u8] = if !last_p3_is_o2 { &p3_history } else { &[] };
+                    lzss_decompress(prefix, &lzss_bytes, raw_len)?
+                };
+                push_history(&mut p3_history, &decoded);
+                last_p3_is_o2 = false;
+                planar_delta_decode(&decoded, 3, raw_len)
+            }
+            BLOCK_PLANAR3_O2_LZSS_HUF4 => {
+                let lzss_bytes = lzss_huf4_decode(&data)?;
+                let decoded = {
+                    let prefix: &[u8] = if last_p3_is_o2 { &p3_history } else { &[] };
+                    lzss_decompress(prefix, &lzss_bytes, raw_len)?
+                };
+                push_history(&mut p3_history, &decoded);
+                last_p3_is_o2 = true;
                 planar_o2_delta_decode(&decoded, 3, raw_len)
             }
             BLOCK_PLANAR4_O2_LZSS_HUF3 => {
@@ -1609,12 +1699,14 @@ pub fn decompress<S: Read + Seek, W: Write + Seek>(mut input: S, mut output: W) 
             }
             BLOCK_PLANAR4_S16_O2_LZSS_HUF4 => {
                 let lzss_bytes = lzss_huf4_decode(&data)?;
-                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                let decoded = lzss_decompress(&sp_history, &lzss_bytes, raw_len)?;
+                push_history(&mut sp_history, &decoded);
                 stereo_planar_s16_o2_decode(&decoded, raw_len)
             }
             BLOCK_PLANAR4_S16_O3_LZSS_HUF4 => {
                 let lzss_bytes = lzss_huf4_decode(&data)?;
-                let decoded = lzss_decompress(&[], &lzss_bytes, raw_len)?;
+                let decoded = lzss_decompress(&sp_history, &lzss_bytes, raw_len)?;
+                push_history(&mut sp_history, &decoded);
                 stereo_planar_s16_o3_decode(&decoded, raw_len)
             }
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown block type")),
