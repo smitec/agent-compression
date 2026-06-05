@@ -3,3 +3,6 @@ outputs/
 samples/
 samples-holdout/
 debug.csv
+
+.ipynb_checkpoints/
+.venv/
