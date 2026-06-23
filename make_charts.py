@@ -80,7 +80,7 @@ def chart_evolution():
                 textcoords="offset points", xytext=(14, -4), ha="left")
     ax.annotate(f"{last['compressible_ratio']:.2f}",
                 (len(df) - 1, last["compressible_ratio"]),
-                textcoords="offset points", xytext=(0, -16), ha="center",
+                textcoords="offset points", xytext=(0, -22), ha="center",
                 color=HIGHLIGHT, fontweight="bold")
 
     fig.tight_layout()
